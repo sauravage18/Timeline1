@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Timeline Vault Pro - Smart Backup</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { background: #52527a; color: #eeeeee; background-attachment: fixed; }
+        .hidden-options .btn-opt { display: none !important; }
+        .hidden-options .keep-visible { display: flex !important; }
+        .image-container img { width: 100%; display: block; background: #0f172a; transition: all 0.3s ease; }
+        .img-wrapped { height: 200px !important; object-fit: cover; }
+        .img-unwrapped { height: auto !important; object-fit: contain; }
+        .auto-expand { overflow: hidden; min-height: 80px; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .sortable-ghost { opacity: 0.3; background: #312e81; border: 2px dashed #6366f1; }
+        .drag-handle { cursor: grab; }
+        .vault-card {
+            background: linear-gradient(145deg, #5138c7 0%, #6246ea 45%, #b94343 100%);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+            color: white;
+        }
+        @keyframes copySuccess {
+            0% { background-color: transparent; }
+            50% { background-color: rgba(16, 185, 129, 0.2); }
+            100% { background-color: transparent; }
+        }
+        .copy-flash { animation: copySuccess 0.6s ease-in-out; }
+    </style>
+</head>
+<body class="min-h-screen pb-10">
+
+    <div id="dashboard" class="max-w-2xl mx-auto p-4">
+        <div class="flex justify-between items-center mb-6 mt-4">
+            <h1 class="text-2xl font-black text-white tracking-tight">Timeline Vault</h1>
+            <div class="flex gap-2">
+                <button onclick="exportAllData()" id="exportBtn" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Backup All (ZIP)</button>
+                <button onclick="triggerRestore()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Restore All</button>
+            </div>
+        </div>
+        <div class="mb-6">
+            <input type="text" id="projectSearch" oninput="renderProjects()" placeholder="Search timelines..." 
+                class="w-full p-3 rounded-xl bg-slate-900/50 border border-slate-700 text-white shadow-inner outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div id="projectList" class="grid gap-4"></div>
+        <button onclick="createNewProject()" class="w-full mt-8 border-2 border-dashed border-slate-700 p-8 rounded-2xl text-slate-500 font-bold hover:bg-white/5 hover:text-slate-300 transition-all">
+            + Create New Timeline
+        </button>
+    </div>
+
+    <div id="editor" class="hidden">
+        <header class="sticky top-0 bg-slate-950/80 backdrop-blur-xl shadow-2xl border-b border-white/10 p-3 z-30">
+            <div class="max-w-2xl mx-auto flex flex-col gap-3">
+                <div class="flex items-center gap-2">
+                    <button onclick="showDashboard()" class="text-blue-400 font-bold pr-2 border-r border-white/10">← Back</button>
+                    <input id="projectTitleInput" type="text" class="bg-transparent p-1 text-xl font-bold focus:outline-none flex-grow text-white">
+                </div>
+                <div class="flex gap-2 overflow-x-auto no-scrollbar">
+                    <button onclick="toggleOptions()" id="toggleBtn" class="whitespace-nowrap bg-blue-900/40 border border-blue-400/30 text-white px-4 py-2 rounded-lg text-xs font-bold uppercase">Show Options</button>
+                    <button onclick="toggleWrap()" id="wrapBtn" class="whitespace-nowrap text-white px-4 py-2 rounded-lg text-xs font-bold uppercase">Wrap Content</button>
+                    <button onclick="deleteCurrentProject()" class="whitespace-nowrap bg-red-900/20 text-red-400 border border-red-900/40 px-4 py-2 rounded-lg text-xs font-bold uppercase">Delete</button>
+                </div>
+            </div>
+        </header>
+        <main class="max-w-2xl mx-auto mt-4 px-3" id="cardContainer"></main>
+        <div id="lazyLoadSentinel" class="h-20 w-full flex items-center justify-center text-slate-400 text-sm italic">Loading more...</div>
+    </div>
+
+    <input type="file" id="restoreFile" class="hidden" accept=".zip,.json" onchange="importAllData(event)">
+
+    <script>
+        const db = new Dexie("MultiTimelineDB");
+        db.version(5).stores({
+            projects: '++id, title, lastModified, isWrapped',
+            cards: '++id, projectId, sortOrder, [projectId+sortOrder]' 
+        });
+
+        let currentProjectId = null;
+        let showAllButtons = false;
+        let sortableInstance = null;
+        let cardsLoaded = 0;
+        const PAGE_SIZE = 20;
+        let observer = null;
+
+        async function init() { renderProjects(); }
+
+        async function renderProjects() {
+            const query = document.getElementById('projectSearch').value.toLowerCase();
+            const projects = await db.projects.orderBy('lastModified').reverse().toArray();
+            const filtered = projects.filter(p => p.title.toLowerCase().includes(query));
+            const list = document.getElementById('projectList');
+            list.innerHTML = '';
+            filtered.forEach(p => {
+                const item = document.createElement('div');
+                item.className = "vault-card p-5 rounded-2xl flex justify-between items-center cursor-pointer hover:scale-[1.01] transition-all active:scale-[0.98]";
+                item.onclick = () => openProject(p.id);
+                item.innerHTML = `<div><h3 class="font-bold text-lg text-white">${p.title || 'Untitled'}</h3><p class="text-xs text-slate-300 opacity-70">Modified: ${new Date(p.lastModified).toLocaleDateString()}</p></div><span class="text-blue-200 font-bold">Open →</span>`;
+                list.appendChild(item);
+            });
+        }
+
+        async function openProject(id) {
+            currentProjectId = id;
+            cardsLoaded = 0;
+            const project = await db.projects.get(id);
+            document.getElementById('projectTitleInput').value = project.title;
+            document.getElementById('dashboard').classList.add('hidden');
+            document.getElementById('editor').classList.remove('hidden');
+            document.getElementById('cardContainer').innerHTML = '';
+            showAllButtons = false;
+            updateWrapButtonUI(project.isWrapped);
+            setupLazyLoading();
+        }
+
+        function setupLazyLoading() {
+            if (observer) observer.disconnect();
+            observer = new IntersectionObserver(async (entries) => {
+                if (entries[0].isIntersecting) loadMoreCards();
+            }, { threshold: 0.1, rootMargin: '300px' });
+            observer.observe(document.getElementById('lazyLoadSentinel'));
+        }
+
+        async function loadMoreCards() {
+            const nextBatch = await db.cards
+                .where('[projectId+sortOrder]')
+                .between([currentProjectId, Dexie.minKey], [currentProjectId, Dexie.maxKey])
+                .offset(cardsLoaded)
+                .limit(PAGE_SIZE)
+                .toArray();
+            
+            if (nextBatch.length === 0) {
+                if (cardsLoaded === 0) renderEmptyState();
+                document.getElementById('lazyLoadSentinel').innerText = "End of Timeline";
+                return;
+            }
+
+            const project = await db.projects.get(currentProjectId);
+            const container = document.getElementById('cardContainer');
+
+            nextBatch.forEach(card => {
+                if (!document.querySelector(`[data-id="${card.id}"]`)) {
+                    const cardWrapper = createCardElement(card, project.isWrapped);
+                    container.appendChild(cardWrapper);
+                    autoResize(document.getElementById(`text-${card.id}`));
+                }
+            });
+
+            cardsLoaded += nextBatch.length;
+            initSortable();
+        }
+
+        function createCardElement(card, isWrapped) {
+            const imgClass = isWrapped ? 'img-wrapped' : 'img-unwrapped';
+            const cardWrapper = document.createElement('div');
+            cardWrapper.dataset.id = card.id;
+            cardWrapper.className = "timeline-item-container mb-4";
+            
+            const imageHtml = card.image 
+                ? `<img src="${card.image}" class="${imgClass}" id="img-display-${card.id}" loading="lazy" />` 
+                : `<div class="h-24 flex items-center justify-center bg-slate-950/50 text-slate-500 text-xs italic" id="img-display-${card.id}">No image added</div>`;
+
+            cardWrapper.innerHTML = `
+                <div class="vault-card rounded-2xl overflow-hidden ${!showAllButtons ? 'hidden-options' : ''}">
+                    <div class="p-2 border-b border-white/5 bg-black/20 flex justify-between items-center btn-opt">
+                        <div class="flex items-center gap-2">
+                            <span class="drag-handle text-slate-400 hover:text-blue-400 p-1">⠿</span>
+                            <span class="text-[10px] text-slate-300 italic font-mono">ID: ${card.id}</span>
+                        </div>
+                        <button onclick="deleteCard(${card.id})" class="text-red-400 text-[10px] font-bold uppercase bg-red-900/30 px-2 py-1 rounded">Delete</button>
+                    </div>
+                    <div class="image-container relative" id="img-cont-${card.id}">
+                        ${imageHtml}
+                        <div class="p-2 flex gap-2 bg-black/20 border-t border-white/5 items-center">
+                            <button onclick="triggerUpload(${card.id})" class="flex-grow btn-opt bg-blue-600/20 text-blue-200 font-bold py-2 rounded-lg text-xs uppercase border border-blue-500/30 transition-all hover:bg-blue-600/40">Replace / Add</button>
+                            <div id="dl-cont-${card.id}" class="flex">
+                                ${card.image ? `<button onclick="downloadImage('${card.image}', ${card.id}, '${card.mimeType}')" class="keep-visible bg-slate-900/80 text-white px-4 py-2 rounded-lg font-bold shadow-sm text-xs border border-white/10 hover:bg-slate-800">Download ↓</button>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="p-4">
+                        <textarea id="text-${card.id}" readonly class="auto-expand w-full bg-black/20 border border-transparent rounded-lg p-2 text-slate-200 outline-none resize-none transition-all block focus:border-blue-500/50" oninput="autoResize(this)">${card.text || ''}</textarea>
+                        <div class="flex gap-2 mt-4">
+                            <button onclick="toggleEdit(${card.id})" id="edit-btn-${card.id}" class="flex-grow btn-opt bg-blue-600 text-white font-bold py-3 rounded-xl text-sm shadow-lg hover:bg-blue-500 transition-colors">Edit Text</button>
+                            <button onclick="copyCurrentText(${card.id})" class="px-6 bg-white/5 text-slate-300 font-bold py-3 rounded-xl text-sm hover:bg-white/10 transition-colors">Copy</button>
+                        </div>
+                    </div>
+                    <input type="file" id="file-${card.id}" class="hidden" accept="image/*" onchange="handleFileUpload(event, ${card.id})">
+                </div>
+                <div class="flex justify-center py-4 add-below-btn">
+                    <button onclick="addNewCard(${card.sortOrder})" class="group flex items-center gap-3 text-slate-400 hover:text-blue-300 transition-all">
+                        <div class="h-[1px] w-8 bg-current opacity-20"></div>
+                        <span class="text-[10px] font-black uppercase tracking-[0.3em]">+ Add Below</span>
+                        <div class="h-[1px] w-8 bg-current opacity-20"></div>
+                    </button>
+                </div>
+            `;
+            return cardWrapper;
+        }
+
+        async function handleFileUpload(ev, id) {
+            const file = ev.target.files[0];
+            if (!file) return;
+            const mimeType = file.type;
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                const b64 = e.target.result;
+                await db.cards.update(id, { image: b64, mimeType: mimeType });
+                const imgCont = document.getElementById(`img-cont-${id}`);
+                const dlCont = document.getElementById(`dl-cont-${id}`);
+                const project = await db.projects.get(currentProjectId);
+                const imgClass = project.isWrapped ? 'img-wrapped' : 'img-unwrapped';
+                imgCont.querySelector(`#img-display-${id}`).outerHTML = `<img src="${b64}" class="${imgClass}" id="img-display-${id}" />`;
+                dlCont.innerHTML = `<button onclick="downloadImage('${b64}', ${id}, '${mimeType}')" class="keep-visible bg-slate-900/80 text-white px-4 py-2 rounded-lg font-bold shadow-sm text-xs border border-white/10 hover:bg-slate-800">Download ↓</button>`;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        async function addNewCard(targetSortOrder = null) {
+            const allCards = await db.cards.where('projectId').equals(currentProjectId).sortBy('sortOrder');
+            let newSortOrder;
+            if (allCards.length === 0) {
+                newSortOrder = 1000000;
+            } else if (targetSortOrder === null) {
+                newSortOrder = allCards[allCards.length - 1].sortOrder + 1000000;
+            } else {
+                const index = allCards.findIndex(c => c.sortOrder === targetSortOrder);
+                const nextCard = allCards[index + 1];
+                newSortOrder = nextCard ? (targetSortOrder + nextCard.sortOrder) / 2 : targetSortOrder + 1000000;
+            }
+            await db.cards.add({ projectId: currentProjectId, text: "", image: null, sortOrder: newSortOrder });
+            await db.projects.update(currentProjectId, { lastModified: Date.now() });
+            refreshCurrentView(); 
+        }
+
+        async function refreshCurrentView() {
+            const container = document.getElementById('cardContainer');
+            const currentScroll = window.scrollY;
+            container.innerHTML = '';
+            cardsLoaded = 0;
+            await loadMoreCards();
+            window.scrollTo({ top: currentScroll, behavior: 'instant' });
+        }
+
+        function downloadImage(b64, id, mimeType) {
+            const extension = mimeType ? mimeType.split('/')[1] : 'png';
+            const a = Object.assign(document.createElement('a'), { 
+                href: b64, 
+                download: `vault-img-${id}.${extension}` 
+            });
+            a.click();
+        }
+
+        function renderEmptyState() {
+            document.getElementById('cardContainer').innerHTML = `<div class="py-20 text-center"><button onclick="addNewCard()" class="bg-blue-600 hover:bg-blue-500 text-white px-8 py-4 rounded-2xl font-bold tracking-wide uppercase text-sm shadow-2xl transition-all scale-100 hover:scale-105">+ Start Timeline</button></div>`;
+        }
+
+        function showDashboard() {
+            document.getElementById('dashboard').classList.remove('hidden');
+            document.getElementById('editor').classList.add('hidden');
+            renderProjects();
+        }
+
+        async function createNewProject() {
+            const id = await db.projects.add({ title: "New Timeline", lastModified: Date.now(), isWrapped: false });
+            openProject(id);
+        }
+
+        function initSortable() {
+            const el = document.getElementById('cardContainer');
+            if (sortableInstance) sortableInstance.destroy();
+            sortableInstance = Sortable.create(el, {
+                handle: '.drag-handle', ghostClass: 'sortable-ghost', animation: 200,
+                onEnd: async function () {
+                    const itemEls = el.querySelectorAll('.timeline-item-container');
+                    const updates = [];
+                    for (let i = 0; i < itemEls.length; i++) {
+                        const id = parseInt(itemEls[i].dataset.id);
+                        updates.push(db.cards.update(id, { sortOrder: (i + 1) * 1000000 }));
+                    }
+                    await Promise.all(updates);
+                    await db.projects.update(currentProjectId, { lastModified: Date.now() });
+                }
+            });
+        }
+
+        function autoResize(el) { if(el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; } }
+
+        async function toggleWrap() {
+            const p = await db.projects.get(currentProjectId);
+            const newState = !p.isWrapped;
+            await db.projects.update(currentProjectId, { isWrapped: newState });
+            updateWrapButtonUI(newState);
+            refreshCurrentView();
+        }
+
+        function updateWrapButtonUI(state) {
+            const btn = document.getElementById('wrapBtn');
+            btn.innerText = state ? "Unwrap Content" : "Wrap Content";
+            btn.className = `whitespace-nowrap ${state ? 'bg-blue-500' : 'bg-indigo-600'} text-white px-4 py-2 rounded-lg text-xs font-bold uppercase transition-all`;
+        }
+
+        async function toggleEdit(id) {
+            const tx = document.getElementById(`text-${id}`);
+            const btn = document.getElementById(`edit-btn-${id}`);
+            if (tx.hasAttribute('readonly')) {
+                tx.removeAttribute('readonly'); tx.classList.add('bg-black/40', 'border-blue-500/50'); tx.focus();
+                btn.innerText = "Save Changes"; btn.classList.replace('bg-blue-600', 'bg-emerald-600');
+            } else {
+                await db.cards.update(id, { text: tx.value });
+                tx.setAttribute('readonly', true); tx.classList.remove('bg-black/40', 'border-blue-500/50');
+                btn.innerText = "Edit Text"; btn.classList.replace('bg-emerald-600', 'bg-blue-600');
+            }
+        }
+
+        async function copyCurrentText(id) {
+            const tx = document.getElementById(`text-${id}`);
+            if(!tx.value) return;
+            await navigator.clipboard.writeText(tx.value);
+            tx.classList.add('copy-flash');
+            setTimeout(() => tx.classList.remove('copy-flash'), 600);
+        }
+
+        function triggerUpload(id) { document.getElementById(`file-${id}`).click(); }
+        async function deleteCard(id) { if(confirm("Delete this card?")) { await db.cards.delete(id); refreshCurrentView(); } }
+        async function deleteCurrentProject() {
+            if(confirm("Delete entire timeline?")) {
+                await db.cards.where('projectId').equals(currentProjectId).delete();
+                await db.projects.delete(currentProjectId);
+                showDashboard();
+            }
+        }
+
+        // --- ENHANCED BACKUP & HYBRID RESTORE ---
+
+        async function exportAllData() {
+            const btn = document.getElementById('exportBtn');
+            const originalText = btn.innerText;
+            btn.innerText = "Zipping...";
+            btn.disabled = true;
+
+            try {
+                const zip = new JSZip();
+                const projects = await db.projects.toArray();
+                const cards = await db.cards.toArray();
+
+                const cleanCards = cards.map(card => {
+                    const { image, ...meta } = card;
+                    return {
+                        ...meta,
+                        hasImage: !!image,
+                        imageExt: image ? (card.mimeType?.split('/')[1] || 'png') : null
+                    };
+                });
+
+                zip.file("data.json", JSON.stringify({ projects, cards: cleanCards }, null, 2));
+
+                const imgFolder = zip.folder("images");
+                for (const card of cards) {
+                    if (card.image) {
+                        const base64Parts = card.image.split(',');
+                        if(base64Parts.length > 1) {
+                            imgFolder.file(`card_${card.id}.${card.mimeType?.split('/')[1] || 'png'}`, base64Parts[1], {base64: true});
+                        }
+                    }
+                }
+
+                const content = await zip.generateAsync({
+                    type: "blob", 
+                    compression: "DEFLATE",
+                    compressionOptions: { level: 6 }
+                });
+                
+                const a = Object.assign(document.createElement('a'), {
+                    href: URL.createObjectURL(content),
+                    download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`
+                });
+                a.click();
+            } catch (err) {
+                console.error(err);
+                alert("Backup failed: " + err.message);
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        function triggerRestore() { document.getElementById('restoreFile').click(); }
+        
+        async function importAllData(ev) {
+            const file = ev.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            
+            // HYBRID HANDLER: Supports .json (legacy) and .zip (new)
+            reader.onload = async (e) => {
+                const buffer = e.target.result;
+                try {
+                    let projects, cards, zipInstance = null;
+
+                    // 1. Detect if it's a ZIP by checking file extension or signature
+                    if (file.name.toLowerCase().endsWith('.zip')) {
+                        zipInstance = await JSZip.loadAsync(buffer);
+                        const jsonFile = zipInstance.file("data.json");
+                        if (!jsonFile) throw new Error("ZIP file is missing 'data.json'");
+                        
+                        const jsonData = await jsonFile.async("string");
+                        const parsed = JSON.parse(jsonData);
+                        projects = parsed.projects;
+                        cards = parsed.cards;
+                    } 
+                    // 2. Handle Legacy JSON files
+                    else if (file.name.toLowerCase().endsWith('.json')) {
+                        const text = new TextDecoder().decode(buffer);
+                        const parsed = JSON.parse(text);
+                        projects = parsed.projects;
+                        cards = parsed.cards;
+                    } else {
+                        throw new Error("Unsupported file format. Please upload .zip or .json");
+                    }
+
+                    if (confirm(`Restore ${projects.length} timelines? This will overwrite current data.`)) {
+                        await db.transaction('rw', db.projects, db.cards, async () => {
+                            await db.projects.clear();
+                            await db.cards.clear();
+
+                            for (let card of cards) {
+                                // If it's a ZIP, pull images from the folder
+                                if (zipInstance && card.hasImage) {
+                                    const imgPath = `images/card_${card.id}.${card.imageExt}`;
+                                    const imgFile = zipInstance.file(imgPath);
+                                    if (imgFile) {
+                                        const b64 = await imgFile.async("base64");
+                                        const mime = `image/${card.imageExt === 'jpg' ? 'jpeg' : card.imageExt}`;
+                                        card.image = `data:${mime};base64,${b64}`;
+                                        card.mimeType = mime;
+                                    }
+                                }
+                                // Cleanup temporary flags used for ZIP transport
+                                delete card.hasImage;
+                                delete card.imageExt;
+                            }
+
+                            await db.projects.bulkAdd(projects);
+                            await db.cards.bulkAdd(cards);
+                        });
+
+                        alert("Restore Successful!");
+                        location.reload();
+                    }
+                } catch (err) {
+                    console.error("Restore Error:", err);
+                    alert("Restore failed: " + err.message);
+                }
+            };
+
+            // Read as ArrayBuffer for reliable binary/ZIP handling
+            reader.readAsArrayBuffer(file);
+        }
+
+        document.getElementById('projectTitleInput').addEventListener('input', async (e) => {
+            await db.projects.update(currentProjectId, { title: e.target.value, lastModified: Date.now() });
+        });
+
+        init();
+    </script>
+</body>
+</html>
