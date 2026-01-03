@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Timeline Vault Pro - Deep Fixed</title>
+    <title>Timeline Vault Pro - Smart Backup</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
@@ -84,7 +84,7 @@
         let showAllButtons = false;
         let sortableInstance = null;
         let cardsLoaded = 0;
-        const PAGE_SIZE = 15; // Smaller batch size improves stability for many timelines
+        const PAGE_SIZE = 20;
         let observer = null;
 
         async function init() { renderProjects(); }
@@ -108,39 +108,24 @@
             currentProjectId = id;
             cardsLoaded = 0;
             const project = await db.projects.get(id);
-            
             document.getElementById('projectTitleInput').value = project.title;
             document.getElementById('dashboard').classList.add('hidden');
             document.getElementById('editor').classList.remove('hidden');
-            
-            // Clear existing UI and observer
-            const container = document.getElementById('cardContainer');
-            container.innerHTML = '';
-            document.getElementById('lazyLoadSentinel').innerText = "Loading cards...";
-            
+            document.getElementById('cardContainer').innerHTML = '';
             showAllButtons = false;
             updateWrapButtonUI(project.isWrapped);
-            
-            // Critical fix: Ensure container is empty before starting lazy load
-            setTimeout(() => setupLazyLoading(), 50);
+            setupLazyLoading();
         }
 
         function setupLazyLoading() {
             if (observer) observer.disconnect();
-            
             observer = new IntersectionObserver(async (entries) => {
-                if (entries[0].isIntersecting) {
-                    await loadMoreCards();
-                }
-            }, { threshold: 0.01, rootMargin: '400px' });
-            
+                if (entries[0].isIntersecting) loadMoreCards();
+            }, { threshold: 0.1, rootMargin: '300px' });
             observer.observe(document.getElementById('lazyLoadSentinel'));
         }
 
         async function loadMoreCards() {
-            if (!currentProjectId) return;
-
-            // Query using the composite index for speed
             const nextBatch = await db.cards
                 .where('[projectId+sortOrder]')
                 .between([currentProjectId, Dexie.minKey], [currentProjectId, Dexie.maxKey])
@@ -148,11 +133,9 @@
                 .limit(PAGE_SIZE)
                 .toArray();
             
-            const sentinel = document.getElementById('lazyLoadSentinel');
-            
             if (nextBatch.length === 0) {
                 if (cardsLoaded === 0) renderEmptyState();
-                sentinel.innerText = "End of Timeline";
+                document.getElementById('lazyLoadSentinel').innerText = "End of Timeline";
                 return;
             }
 
@@ -227,7 +210,12 @@
             reader.onload = async (e) => {
                 const b64 = e.target.result;
                 await db.cards.update(id, { image: b64, mimeType: mimeType });
-                refreshCurrentView();
+                const imgCont = document.getElementById(`img-cont-${id}`);
+                const dlCont = document.getElementById(`dl-cont-${id}`);
+                const project = await db.projects.get(currentProjectId);
+                const imgClass = project.isWrapped ? 'img-wrapped' : 'img-unwrapped';
+                imgCont.querySelector(`#img-display-${id}`).outerHTML = `<img src="${b64}" class="${imgClass}" id="img-display-${id}" />`;
+                dlCont.innerHTML = `<button onclick="downloadImage('${b64}', ${id}, '${mimeType}')" class="keep-visible bg-slate-900/80 text-white px-4 py-2 rounded-lg font-bold shadow-sm text-xs border border-white/10 hover:bg-slate-800">Download ↓</button>`;
             };
             reader.readAsDataURL(file);
         }
@@ -256,7 +244,6 @@
             cardsLoaded = 0;
             await loadMoreCards();
             window.scrollTo({ top: currentScroll, behavior: 'instant' });
-            setupLazyLoading(); // Refresh the observer
         }
 
         function downloadImage(b64, id, mimeType) {
@@ -273,8 +260,6 @@
         }
 
         function showDashboard() {
-            currentProjectId = null;
-            if(observer) observer.disconnect();
             document.getElementById('dashboard').classList.remove('hidden');
             document.getElementById('editor').classList.add('hidden');
             renderProjects();
@@ -341,7 +326,7 @@
         }
 
         function triggerUpload(id) { document.getElementById(`file-${id}`).click(); }
-        async function deleteCard(id) { if(confirm("Delete card?")) { await db.cards.delete(id); refreshCurrentView(); } }
+        async function deleteCard(id) { if(confirm("Delete this card?")) { await db.cards.delete(id); refreshCurrentView(); } }
         async function deleteCurrentProject() {
             if(confirm("Delete entire timeline?")) {
                 await db.cards.where('projectId').equals(currentProjectId).delete();
@@ -350,8 +335,11 @@
             }
         }
 
+        // --- ENHANCED BACKUP & HYBRID RESTORE ---
+
         async function exportAllData() {
             const btn = document.getElementById('exportBtn');
+            const originalText = btn.innerText;
             btn.innerText = "Zipping...";
             btn.disabled = true;
 
@@ -362,26 +350,43 @@
 
                 const cleanCards = cards.map(card => {
                     const { image, ...meta } = card;
-                    return { ...meta, hasImage: !!image, imageExt: image ? (card.mimeType?.split('/')[1] || 'png') : null };
+                    return {
+                        ...meta,
+                        hasImage: !!image,
+                        imageExt: image ? (card.mimeType?.split('/')[1] || 'png') : null
+                    };
                 });
 
                 zip.file("data.json", JSON.stringify({ projects, cards: cleanCards }, null, 2));
+
                 const imgFolder = zip.folder("images");
                 for (const card of cards) {
                     if (card.image) {
-                        const b64Data = card.image.split(',')[1];
-                        imgFolder.file(`card_${card.id}.${card.mimeType?.split('/')[1] || 'png'}`, b64Data, {base64: true});
+                        const base64Parts = card.image.split(',');
+                        if(base64Parts.length > 1) {
+                            imgFolder.file(`card_${card.id}.${card.mimeType?.split('/')[1] || 'png'}`, base64Parts[1], {base64: true});
+                        }
                     }
                 }
 
-                const content = await zip.generateAsync({type: "blob", compression: "DEFLATE"});
+                const content = await zip.generateAsync({
+                    type: "blob", 
+                    compression: "DEFLATE",
+                    compressionOptions: { level: 6 }
+                });
+                
                 const a = Object.assign(document.createElement('a'), {
                     href: URL.createObjectURL(content),
                     download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`
                 });
                 a.click();
-            } catch (err) { alert("Backup failed: " + err.message); }
-            finally { btn.innerText = "Backup All (ZIP)"; btn.disabled = false; }
+            } catch (err) {
+                console.error(err);
+                alert("Backup failed: " + err.message);
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
         }
 
         function triggerRestore() { document.getElementById('restoreFile').click(); }
@@ -389,49 +394,72 @@
         async function importAllData(ev) {
             const file = ev.target.files[0];
             if (!file) return;
+
             const reader = new FileReader();
+            
+            // HYBRID HANDLER: Supports .json (legacy) and .zip (new)
             reader.onload = async (e) => {
                 const buffer = e.target.result;
                 try {
                     let projects, cards, zipInstance = null;
-                    if (file.name.endsWith('.zip')) {
+
+                    // 1. Detect if it's a ZIP by checking file extension or signature
+                    if (file.name.toLowerCase().endsWith('.zip')) {
                         zipInstance = await JSZip.loadAsync(buffer);
-                        const jsonData = await zipInstance.file("data.json").async("string");
+                        const jsonFile = zipInstance.file("data.json");
+                        if (!jsonFile) throw new Error("ZIP file is missing 'data.json'");
+                        
+                        const jsonData = await jsonFile.async("string");
                         const parsed = JSON.parse(jsonData);
-                        projects = parsed.projects; cards = parsed.cards;
-                    } else {
+                        projects = parsed.projects;
+                        cards = parsed.cards;
+                    } 
+                    // 2. Handle Legacy JSON files
+                    else if (file.name.toLowerCase().endsWith('.json')) {
                         const text = new TextDecoder().decode(buffer);
                         const parsed = JSON.parse(text);
-                        projects = parsed.projects; cards = parsed.cards;
+                        projects = parsed.projects;
+                        cards = parsed.cards;
+                    } else {
+                        throw new Error("Unsupported file format. Please upload .zip or .json");
                     }
 
-                    if (confirm(`Restore ${projects.length} timelines?`)) {
+                    if (confirm(`Restore ${projects.length} timelines? This will overwrite current data.`)) {
                         await db.transaction('rw', db.projects, db.cards, async () => {
                             await db.projects.clear();
                             await db.cards.clear();
 
-                            // Fix sortOrder if missing and reattach images
-                            for (let i = 0; i < cards.length; i++) {
-                                let card = cards[i];
-                                if (!card.sortOrder) card.sortOrder = (i + 1) * 1000000;
-                                
+                            for (let card of cards) {
+                                // If it's a ZIP, pull images from the folder
                                 if (zipInstance && card.hasImage) {
-                                    const imgFile = zipInstance.file(`images/card_${card.id}.${card.imageExt}`);
+                                    const imgPath = `images/card_${card.id}.${card.imageExt}`;
+                                    const imgFile = zipInstance.file(imgPath);
                                     if (imgFile) {
                                         const b64 = await imgFile.async("base64");
-                                        card.image = `data:image/${card.imageExt};base64,${b64}`;
-                                        card.mimeType = `image/${card.imageExt}`;
+                                        const mime = `image/${card.imageExt === 'jpg' ? 'jpeg' : card.imageExt}`;
+                                        card.image = `data:${mime};base64,${b64}`;
+                                        card.mimeType = mime;
                                     }
                                 }
-                                delete card.hasImage; delete card.imageExt;
+                                // Cleanup temporary flags used for ZIP transport
+                                delete card.hasImage;
+                                delete card.imageExt;
                             }
+
                             await db.projects.bulkAdd(projects);
                             await db.cards.bulkAdd(cards);
                         });
+
+                        alert("Restore Successful!");
                         location.reload();
                     }
-                } catch (err) { alert("Restore failed: " + err.message); }
+                } catch (err) {
+                    console.error("Restore Error:", err);
+                    alert("Restore failed: " + err.message);
+                }
             };
+
+            // Read as ArrayBuffer for reliable binary/ZIP handling
             reader.readAsArrayBuffer(file);
         }
 
