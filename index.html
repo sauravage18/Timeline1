@@ -3,10 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Timeline Vault Pro - Optimized</title>
+    <title>Timeline Vault Pro - Smart Backup</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         body { background: #52527a; color: #eeeeee; background-attachment: fixed; }
         .hidden-options .btn-opt { display: none !important; }
@@ -38,7 +39,7 @@
         <div class="flex justify-between items-center mb-6 mt-4">
             <h1 class="text-2xl font-black text-white tracking-tight">Timeline Vault</h1>
             <div class="flex gap-2">
-                <button onclick="exportAllData()" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Backup All</button>
+                <button onclick="exportAllData()" id="exportBtn" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Backup All (ZIP)</button>
                 <button onclick="triggerRestore()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Restore All</button>
             </div>
         </div>
@@ -70,11 +71,10 @@
         <div id="lazyLoadSentinel" class="h-20 w-full flex items-center justify-center text-slate-400 text-sm italic">Loading more...</div>
     </div>
 
-    <input type="file" id="restoreFile" class="hidden" accept=".json" onchange="importAllData(event)">
+    <input type="file" id="restoreFile" class="hidden" accept=".zip,.json" onchange="importAllData(event)">
 
     <script>
         const db = new Dexie("MultiTimelineDB");
-        // Update to Version 5 for the performance index [projectId+sortOrder]
         db.version(5).stores({
             projects: '++id, title, lastModified, isWrapped',
             cards: '++id, projectId, sortOrder, [projectId+sortOrder]' 
@@ -84,7 +84,7 @@
         let showAllButtons = false;
         let sortableInstance = null;
         let cardsLoaded = 0;
-        const PAGE_SIZE = 20; // Loads 20 from DB at a time
+        const PAGE_SIZE = 20;
         let observer = null;
 
         async function init() { renderProjects(); }
@@ -121,12 +121,11 @@
             if (observer) observer.disconnect();
             observer = new IntersectionObserver(async (entries) => {
                 if (entries[0].isIntersecting) loadMoreCards();
-            }, { threshold: 0.1, rootMargin: '300px' }); // Margin 300px loads before user hits bottom
+            }, { threshold: 0.1, rootMargin: '300px' });
             observer.observe(document.getElementById('lazyLoadSentinel'));
         }
 
         async function loadMoreCards() {
-            // OPTIMIZED: only queries 20 items using index, offset, and limit
             const nextBatch = await db.cards
                 .where('[projectId+sortOrder]')
                 .between([currentProjectId, Dexie.minKey], [currentProjectId, Dexie.maxKey])
@@ -336,34 +335,132 @@
             }
         }
 
+        // --- ENHANCED BACKUP & HYBRID RESTORE ---
+
         async function exportAllData() {
-            const projects = await db.projects.toArray();
-            const cards = await db.cards.toArray();
-            const blob = new Blob([JSON.stringify({ projects, cards })], { type: 'application/json' });
-            const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `Vault-Export-${Date.now()}.json` });
-            a.click();
+            const btn = document.getElementById('exportBtn');
+            const originalText = btn.innerText;
+            btn.innerText = "Zipping...";
+            btn.disabled = true;
+
+            try {
+                const zip = new JSZip();
+                const projects = await db.projects.toArray();
+                const cards = await db.cards.toArray();
+
+                const cleanCards = cards.map(card => {
+                    const { image, ...meta } = card;
+                    return {
+                        ...meta,
+                        hasImage: !!image,
+                        imageExt: image ? (card.mimeType?.split('/')[1] || 'png') : null
+                    };
+                });
+
+                zip.file("data.json", JSON.stringify({ projects, cards: cleanCards }, null, 2));
+
+                const imgFolder = zip.folder("images");
+                for (const card of cards) {
+                    if (card.image) {
+                        const base64Parts = card.image.split(',');
+                        if(base64Parts.length > 1) {
+                            imgFolder.file(`card_${card.id}.${card.mimeType?.split('/')[1] || 'png'}`, base64Parts[1], {base64: true});
+                        }
+                    }
+                }
+
+                const content = await zip.generateAsync({
+                    type: "blob", 
+                    compression: "DEFLATE",
+                    compressionOptions: { level: 6 }
+                });
+                
+                const a = Object.assign(document.createElement('a'), {
+                    href: URL.createObjectURL(content),
+                    download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`
+                });
+                a.click();
+            } catch (err) {
+                console.error(err);
+                alert("Backup failed: " + err.message);
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
         }
 
         function triggerRestore() { document.getElementById('restoreFile').click(); }
+        
         async function importAllData(ev) {
             const file = ev.target.files[0];
             if (!file) return;
+
             const reader = new FileReader();
+            
+            // HYBRID HANDLER: Supports .json (legacy) and .zip (new)
             reader.onload = async (e) => {
-                const data = JSON.parse(e.target.result);
-                if (confirm("Replace all data?")) {
-                    await db.projects.clear(); await db.cards.clear();
-                    await db.projects.bulkAdd(data.projects); await db.cards.bulkAdd(data.cards);
-                    location.reload();
+                const buffer = e.target.result;
+                try {
+                    let projects, cards, zipInstance = null;
+
+                    // 1. Detect if it's a ZIP by checking file extension or signature
+                    if (file.name.toLowerCase().endsWith('.zip')) {
+                        zipInstance = await JSZip.loadAsync(buffer);
+                        const jsonFile = zipInstance.file("data.json");
+                        if (!jsonFile) throw new Error("ZIP file is missing 'data.json'");
+                        
+                        const jsonData = await jsonFile.async("string");
+                        const parsed = JSON.parse(jsonData);
+                        projects = parsed.projects;
+                        cards = parsed.cards;
+                    } 
+                    // 2. Handle Legacy JSON files
+                    else if (file.name.toLowerCase().endsWith('.json')) {
+                        const text = new TextDecoder().decode(buffer);
+                        const parsed = JSON.parse(text);
+                        projects = parsed.projects;
+                        cards = parsed.cards;
+                    } else {
+                        throw new Error("Unsupported file format. Please upload .zip or .json");
+                    }
+
+                    if (confirm(`Restore ${projects.length} timelines? This will overwrite current data.`)) {
+                        await db.transaction('rw', db.projects, db.cards, async () => {
+                            await db.projects.clear();
+                            await db.cards.clear();
+
+                            for (let card of cards) {
+                                // If it's a ZIP, pull images from the folder
+                                if (zipInstance && card.hasImage) {
+                                    const imgPath = `images/card_${card.id}.${card.imageExt}`;
+                                    const imgFile = zipInstance.file(imgPath);
+                                    if (imgFile) {
+                                        const b64 = await imgFile.async("base64");
+                                        const mime = `image/${card.imageExt === 'jpg' ? 'jpeg' : card.imageExt}`;
+                                        card.image = `data:${mime};base64,${b64}`;
+                                        card.mimeType = mime;
+                                    }
+                                }
+                                // Cleanup temporary flags used for ZIP transport
+                                delete card.hasImage;
+                                delete card.imageExt;
+                            }
+
+                            await db.projects.bulkAdd(projects);
+                            await db.cards.bulkAdd(cards);
+                        });
+
+                        alert("Restore Successful!");
+                        location.reload();
+                    }
+                } catch (err) {
+                    console.error("Restore Error:", err);
+                    alert("Restore failed: " + err.message);
                 }
             };
-            reader.readAsText(file);
-        }
 
-        function toggleOptions() { 
-            showAllButtons = !showAllButtons; 
-            document.getElementById('toggleBtn').innerText = showAllButtons ? "Hide Options" : "Show Options";
-            refreshCurrentView(); 
+            // Read as ArrayBuffer for reliable binary/ZIP handling
+            reader.readAsArrayBuffer(file);
         }
 
         document.getElementById('projectTitleInput').addEventListener('input', async (e) => {
