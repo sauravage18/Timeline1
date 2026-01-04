@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Timeline Vault Pro - Fixed Navigation</title>
+    <title>Timeline Vault Pro - Fixed Restore</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
@@ -40,7 +40,7 @@
             <h1 class="text-2xl font-black text-white tracking-tight">Timeline Vault</h1>
             <div class="flex gap-2">
                 <button onclick="exportAllData()" id="exportBtn" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Backup All (ZIP)</button>
-                <button onclick="triggerRestore()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Restore All</button>
+                <button onclick="triggerRestore()" id="restoreBtn" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors">Restore All</button>
             </div>
         </div>
         <div class="mb-6">
@@ -103,6 +103,7 @@
         async function openProject(id, resetUI = true) {
             currentProjectId = id;
             const project = await db.projects.get(id);
+            if (!project) return showDashboard();
             if (resetUI) showAllButtons = false;
             
             document.getElementById('projectTitleInput').value = project.title;
@@ -131,7 +132,6 @@
             }
         }
 
-        // Helper to refresh without losing scroll or UI state
         async function refreshCurrentView() {
             const scrollPos = window.scrollY;
             await openProject(currentProjectId, false);
@@ -208,8 +208,6 @@
             reader.onload = async (e) => {
                 const b64 = e.target.result;
                 await db.cards.update(id, { image: b64, mimeType: mimeType });
-                
-                // Patch UI locally to avoid scroll jump
                 const img = document.getElementById(`img-display-${id}`);
                 const dlCont = document.getElementById(`dl-cont-${id}`);
                 const project = await db.projects.get(currentProjectId);
@@ -224,7 +222,6 @@
                 } else {
                     img.src = b64;
                 }
-                
                 dlCont.innerHTML = `<button onclick="downloadImage('${b64}', ${id}, '${mimeType}')" class="keep-visible bg-slate-900/80 text-white px-4 py-2 rounded-lg font-bold shadow-sm text-xs border border-white/10 hover:bg-slate-800">Download ↓</button>`;
             };
             reader.readAsDataURL(file);
@@ -334,7 +331,6 @@
             }
         }
 
-        // Export/Import logic
         async function exportAllData() {
             const btn = document.getElementById('exportBtn');
             btn.innerText = "Zipping...";
@@ -363,10 +359,15 @@
         }
 
         function triggerRestore() { document.getElementById('restoreFile').click(); }
-        
+
         async function importAllData(ev) {
             const file = ev.target.files[0];
             if (!file) return;
+            const btn = document.getElementById('restoreBtn');
+            const originalText = btn.innerText;
+            btn.innerText = "Restoring...";
+            btn.disabled = true;
+
             const reader = new FileReader();
             reader.onload = async (e) => {
                 const buffer = e.target.result;
@@ -382,35 +383,65 @@
                         const parsed = JSON.parse(text);
                         projects = parsed.projects; cards = parsed.cards;
                     }
-                    if (confirm(`Restore ${projects.length} timelines?`)) {
+
+                    if (confirm(`This will clear existing data and restore ${projects.length} timelines. Continue?`)) {
                         await db.transaction('rw', db.projects, db.cards, async () => {
                             await db.projects.clear();
                             await db.cards.clear();
+
+                            // Mapping old Project IDs to newly generated Project IDs
+                            const projectIdMap = new Map();
+
+                            for (const proj of projects) {
+                                const oldId = proj.id;
+                                delete proj.id; // Let Dexie generate a fresh auto-increment ID
+                                const newId = await db.projects.add(proj);
+                                projectIdMap.set(oldId, newId);
+                            }
+
                             for (let i = 0; i < cards.length; i++) {
                                 let card = cards[i];
-                                if (!card.sortOrder) card.sortOrder = (i + 1) * 1000000;
-                                if (zipInstance && card.hasImage) {
-                                    const imgFile = zipInstance.file(`images/card_${card.id}.${card.imageExt}`);
-                                    if (imgFile) {
-                                        const b64 = await imgFile.async("base64");
-                                        card.image = `data:image/${card.imageExt};base64,${b64}`;
-                                        card.mimeType = `image/${card.imageExt}`;
+                                const oldCardId = card.id; // Store to find image in zip
+                                
+                                // Redirect card to the new Project ID
+                                card.projectId = projectIdMap.get(card.projectId);
+                                
+                                // Only add card if its project actually exists
+                                if (card.projectId !== undefined) {
+                                    delete card.id; // Let Dexie generate fresh card ID
+
+                                    if (zipInstance && card.hasImage) {
+                                        const imgFile = zipInstance.file(`images/card_${oldCardId}.${card.imageExt}`);
+                                        if (imgFile) {
+                                            const b64 = await imgFile.async("base64");
+                                            card.image = `data:image/${card.imageExt};base64,${b64}`;
+                                            card.mimeType = `image/${card.imageExt}`;
+                                        }
                                     }
+                                    delete card.hasImage; 
+                                    delete card.imageExt;
+                                    await db.cards.add(card);
                                 }
-                                delete card.hasImage; delete card.imageExt;
                             }
-                            await db.projects.bulkAdd(projects);
-                            await db.cards.bulkAdd(cards);
                         });
+                        alert("Restore completed successfully!");
                         location.reload();
                     }
-                } catch (err) { alert("Restore failed: " + err.message); }
+                } catch (err) { 
+                    alert("Restore failed: " + err.message); 
+                    console.error(err);
+                } finally {
+                    btn.innerText = originalText;
+                    btn.disabled = false;
+                }
             };
             reader.readAsArrayBuffer(file);
         }
 
         document.getElementById('projectTitleInput').addEventListener('input', async (e) => {
-            await db.projects.update(currentProjectId, { title: e.target.value, lastModified: Date.now() });
+            if (currentProjectId) {
+                await db.projects.update(currentProjectId, { title: e.target.value, lastModified: Date.now() });
+            }
         });
 
         init();
