@@ -332,17 +332,29 @@
             }
         }
 
-        function getImageExtension(mimeType) {
-            if (!mimeType || typeof mimeType !== 'string') return 'png';
-            const [, ext = 'png'] = mimeType.split('/');
-            return ext.replace(/[^a-zA-Z0-9+.-]/g, '') || 'png';
+        function sanitizeTimelineFolderName(name) {
+            const raw = (name || "").toString().trim();
+            const cleaned = raw
+                .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+                .replace(/\s+/g, " ")
+                .replace(/[. ]+$/g, "");
+            return cleaned || "Untitled Timeline";
         }
 
-        function extractBase64Payload(dataUrl) {
-            if (typeof dataUrl !== 'string') return null;
-            const commaIndex = dataUrl.indexOf(',');
-            if (commaIndex === -1) return null;
-            return dataUrl.slice(commaIndex + 1);
+        function getImageExtensionFromMime(mimeType) {
+            const subtype = mimeType && mimeType.includes("/") ? mimeType.split("/")[1] : "";
+            const ext = (subtype || "png").split("+")[0].replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+            return ext || "png";
+        }
+
+        function guessMimeTypeFromFilename(filename) {
+            const ext = (filename.split(".").pop() || "").toLowerCase();
+            if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+            if (ext === "gif") return "image/gif";
+            if (ext === "webp") return "image/webp";
+            if (ext === "bmp") return "image/bmp";
+            if (ext === "svg") return "image/svg+xml";
+            return "image/png";
         }
 
         async function exportAllData() {
@@ -350,36 +362,54 @@
             btn.innerText = "Zipping...";
             btn.disabled = true;
             try {
-                if (typeof JSZip === 'undefined') {
-                    throw new Error("Backup library failed to load. Refresh and try again.");
-                }
                 const zip = new JSZip();
                 const projects = await db.projects.toArray();
-                const cleanCards = [];
-                const imgFolder = zip.folder("images");
+                const cards = await db.cards.toArray();
+                const usedFolderNames = new Set();
 
-                await db.cards.each((card) => {
-                    const extension = getImageExtension(card.mimeType);
-                    const { image, ...meta } = card;
-                    cleanCards.push({ ...meta, hasImage: !!image, imageExt: image ? extension : null });
+                for (let i = 0; i < projects.length; i++) {
+                    const project = projects[i];
+                    const baseName = sanitizeTimelineFolderName(project.title);
+                    let folderName = baseName;
+                    let counter = 2;
+                    while (usedFolderNames.has(folderName)) {
+                        folderName = `${baseName}-${counter++}`;
+                    }
+                    usedFolderNames.add(folderName);
 
-                    if (!image) return;
-                    const b64Data = extractBase64Payload(image);
-                    if (!b64Data) return;
-                    imgFolder.file(`card_${card.id}.${extension}`, b64Data, { base64: true });
-                });
+                    const timelineFolder = zip.folder(folderName);
+                    const timelineCards = cards
+                        .filter(card => card.projectId === project.id)
+                        .sort((a, b) => a.sortOrder - b.sortOrder);
 
-                zip.file("data.json", JSON.stringify({ projects, cards: cleanCards }, null, 2));
-                const content = await zip.generateAsync({
-                    type: "blob",
-                    compression: "DEFLATE",
-                    compressionOptions: { level: 3 },
-                    streamFiles: true
-                });
-                const backupUrl = URL.createObjectURL(content);
-                const a = Object.assign(document.createElement('a'), { href: backupUrl, download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip` });
+                    const timelineJsonCards = timelineCards.map(card => {
+                        const { image, ...meta } = card;
+                        if (!image) return { ...meta, imageFileName: null };
+                        const ext = getImageExtensionFromMime(card.mimeType);
+                        return { ...meta, imageFileName: `card_${card.id}.${ext}` };
+                    });
+
+                    timelineFolder.file("timeline.json", JSON.stringify({ project, cards: timelineJsonCards }, null, 2));
+
+                    for (const card of timelineCards) {
+                        if (card.image) {
+                            const ext = getImageExtensionFromMime(card.mimeType);
+                            const b64Data = card.image.split(',')[1];
+                            timelineFolder.file(`card_${card.id}.${ext}`, b64Data, { base64: true });
+                        }
+                    }
+                }
+
+                zip.file("backup_manifest.json", JSON.stringify({
+                    version: 2,
+                    format: "timeline-folders",
+                    createdAt: new Date().toISOString(),
+                    timelineCount: projects.length
+                }, null, 2));
+
+                const content = await zip.generateAsync({type: "blob", compression: "DEFLATE"});
+                const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(content), download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip` });
                 a.click();
-                setTimeout(() => URL.revokeObjectURL(backupUrl), 1000);
             } catch (err) { alert("Backup failed: " + err.message); }
             finally { btn.innerText = "Backup All (ZIP)"; btn.disabled = false; }
         }
@@ -398,12 +428,34 @@
             reader.onload = async (e) => {
                 const buffer = e.target.result;
                 try {
-                    let projects, cards, zipInstance = null;
+                    let projects, cards, zipInstance = null, timelinePayloads = null;
                     if (file.name.endsWith('.zip')) {
                         zipInstance = await JSZip.loadAsync(buffer);
-                        const jsonData = await zipInstance.file("data.json").async("string");
-                        const parsed = JSON.parse(jsonData);
-                        projects = parsed.projects; cards = parsed.cards;
+                        const legacyData = zipInstance.file("data.json");
+                        if (legacyData) {
+                            const parsed = JSON.parse(await legacyData.async("string"));
+                            projects = parsed.projects;
+                            cards = parsed.cards;
+                        } else {
+                            const timelineJsonPaths = Object.keys(zipInstance.files)
+                                .filter(path => path.toLowerCase().endsWith("/timeline.json"));
+                            if (!timelineJsonPaths.length) {
+                                throw new Error("No timeline backup data found in ZIP.");
+                            }
+                            timelinePayloads = [];
+                            for (const timelineJsonPath of timelineJsonPaths) {
+                                const jsonFile = zipInstance.file(timelineJsonPath);
+                                if (!jsonFile) continue;
+                                const parsed = JSON.parse(await jsonFile.async("string"));
+                                if (!parsed || !parsed.project || !Array.isArray(parsed.cards)) {
+                                    throw new Error(`Invalid timeline data in ${timelineJsonPath}`);
+                                }
+                                const folderPath = timelineJsonPath.slice(0, timelineJsonPath.lastIndexOf("/") + 1);
+                                timelinePayloads.push({ folderPath, project: parsed.project, cards: parsed.cards });
+                            }
+                            projects = timelinePayloads.map(x => x.project);
+                            cards = timelinePayloads.flatMap(x => x.cards);
+                        }
                     } else {
                         const text = new TextDecoder().decode(buffer);
                         const parsed = JSON.parse(text);
@@ -415,38 +467,65 @@
                             await db.projects.clear();
                             await db.cards.clear();
 
-                            // Mapping old Project IDs to newly generated Project IDs
-                            const projectIdMap = new Map();
+                            if (timelinePayloads) {
+                                for (const timeline of timelinePayloads) {
+                                    const proj = { ...timeline.project };
+                                    delete proj.id;
+                                    const newProjectId = await db.projects.add(proj);
 
-                            for (const proj of projects) {
-                                const oldId = proj.id;
-                                delete proj.id; // Let Dexie generate a fresh auto-increment ID
-                                const newId = await db.projects.add(proj);
-                                projectIdMap.set(oldId, newId);
-                            }
+                                    for (const sourceCard of timeline.cards) {
+                                        const card = { ...sourceCard, projectId: newProjectId };
+                                        delete card.id;
 
-                            for (let i = 0; i < cards.length; i++) {
-                                let card = cards[i];
-                                const oldCardId = card.id; // Store to find image in zip
-                                
-                                // Redirect card to the new Project ID
-                                card.projectId = projectIdMap.get(card.projectId);
-                                
-                                // Only add card if its project actually exists
-                                if (card.projectId !== undefined) {
-                                    delete card.id; // Let Dexie generate fresh card ID
-
-                                    if (zipInstance && card.hasImage) {
-                                        const imgFile = zipInstance.file(`images/card_${oldCardId}.${card.imageExt}`);
-                                        if (imgFile) {
-                                            const b64 = await imgFile.async("base64");
-                                            card.image = `data:image/${card.imageExt};base64,${b64}`;
-                                            card.mimeType = `image/${card.imageExt}`;
+                                        if (zipInstance && card.imageFileName) {
+                                            const imgFile = zipInstance.file(`${timeline.folderPath}${card.imageFileName}`);
+                                            if (imgFile) {
+                                                const b64 = await imgFile.async("base64");
+                                                card.mimeType = card.mimeType || guessMimeTypeFromFilename(card.imageFileName);
+                                                card.image = `data:${card.mimeType};base64,${b64}`;
+                                            }
                                         }
+
+                                        delete card.hasImage;
+                                        delete card.imageExt;
+                                        delete card.imageFileName;
+                                        await db.cards.add(card);
                                     }
-                                    delete card.hasImage; 
-                                    delete card.imageExt;
-                                    await db.cards.add(card);
+                                }
+                            } else {
+                                // Mapping old Project IDs to newly generated Project IDs
+                                const projectIdMap = new Map();
+
+                                for (const proj of projects) {
+                                    const oldId = proj.id;
+                                    delete proj.id; // Let Dexie generate a fresh auto-increment ID
+                                    const newId = await db.projects.add(proj);
+                                    projectIdMap.set(oldId, newId);
+                                }
+
+                                for (let i = 0; i < cards.length; i++) {
+                                    let card = cards[i];
+                                    const oldCardId = card.id; // Store to find image in zip
+                                    
+                                    // Redirect card to the new Project ID
+                                    card.projectId = projectIdMap.get(card.projectId);
+                                    
+                                    // Only add card if its project actually exists
+                                    if (card.projectId !== undefined) {
+                                        delete card.id; // Let Dexie generate fresh card ID
+
+                                        if (zipInstance && card.hasImage) {
+                                            const imgFile = zipInstance.file(`images/card_${oldCardId}.${card.imageExt}`);
+                                            if (imgFile) {
+                                                const b64 = await imgFile.async("base64");
+                                                card.image = `data:image/${card.imageExt};base64,${b64}`;
+                                                card.mimeType = `image/${card.imageExt}`;
+                                            }
+                                        }
+                                        delete card.hasImage; 
+                                        delete card.imageExt;
+                                        await db.cards.add(card);
+                                    }
                                 }
                             }
                         });
