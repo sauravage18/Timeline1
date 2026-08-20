@@ -332,29 +332,54 @@
             }
         }
 
+        function getImageExtension(mimeType) {
+            if (!mimeType || typeof mimeType !== 'string') return 'png';
+            const [, ext = 'png'] = mimeType.split('/');
+            return ext.replace(/[^a-zA-Z0-9+.-]/g, '') || 'png';
+        }
+
+        function extractBase64Payload(dataUrl) {
+            if (typeof dataUrl !== 'string') return null;
+            const commaIndex = dataUrl.indexOf(',');
+            if (commaIndex === -1) return null;
+            return dataUrl.slice(commaIndex + 1);
+        }
+
         async function exportAllData() {
             const btn = document.getElementById('exportBtn');
             btn.innerText = "Zipping...";
             btn.disabled = true;
             try {
+                if (typeof JSZip === 'undefined') {
+                    throw new Error("Backup library failed to load. Refresh and try again.");
+                }
                 const zip = new JSZip();
                 const projects = await db.projects.toArray();
-                const cards = await db.cards.toArray();
-                const cleanCards = cards.map(card => {
-                    const { image, ...meta } = card;
-                    return { ...meta, hasImage: !!image, imageExt: image ? (card.mimeType?.split('/')[1] || 'png') : null };
-                });
-                zip.file("data.json", JSON.stringify({ projects, cards: cleanCards }, null, 2));
+                const cleanCards = [];
                 const imgFolder = zip.folder("images");
-                for (const card of cards) {
-                    if (card.image) {
-                        const b64Data = card.image.split(',')[1];
-                        imgFolder.file(`card_${card.id}.${card.mimeType?.split('/')[1] || 'png'}`, b64Data, {base64: true});
-                    }
-                }
-                const content = await zip.generateAsync({type: "blob", compression: "DEFLATE"});
-                const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(content), download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip` });
+
+                await db.cards.each((card) => {
+                    const extension = getImageExtension(card.mimeType);
+                    const { image, ...meta } = card;
+                    cleanCards.push({ ...meta, hasImage: !!image, imageExt: image ? extension : null });
+
+                    if (!image) return;
+                    const b64Data = extractBase64Payload(image);
+                    if (!b64Data) return;
+                    imgFolder.file(`card_${card.id}.${extension}`, b64Data, { base64: true });
+                });
+
+                zip.file("data.json", JSON.stringify({ projects, cards: cleanCards }, null, 2));
+                const content = await zip.generateAsync({
+                    type: "blob",
+                    compression: "DEFLATE",
+                    compressionOptions: { level: 3 },
+                    streamFiles: true
+                });
+                const backupUrl = URL.createObjectURL(content);
+                const a = Object.assign(document.createElement('a'), { href: backupUrl, download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip` });
                 a.click();
+                setTimeout(() => URL.revokeObjectURL(backupUrl), 1000);
             } catch (err) { alert("Backup failed: " + err.message); }
             finally { btn.innerText = "Backup All (ZIP)"; btn.disabled = false; }
         }
