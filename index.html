@@ -357,6 +357,24 @@
             return "image/png";
         }
 
+        function extractBase64FromDataUrl(dataUrl) {
+            if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return null;
+            const commaIndex = dataUrl.indexOf(",");
+            if (commaIndex < 0) return null;
+            return dataUrl.slice(commaIndex + 1);
+        }
+
+        function downloadBlob(blob, fileName) {
+            const objectUrl = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = objectUrl;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+        }
+
         async function exportAllData() {
             const btn = document.getElementById('exportBtn');
             btn.innerText = "Zipping...";
@@ -364,7 +382,6 @@
             try {
                 const zip = new JSZip();
                 const projects = await db.projects.toArray();
-                const cards = await db.cards.toArray();
                 const usedFolderNames = new Set();
 
                 for (let i = 0; i < projects.length; i++) {
@@ -378,24 +395,31 @@
                     usedFolderNames.add(folderName);
 
                     const timelineFolder = zip.folder(folderName);
-                    const timelineCards = cards
-                        .filter(card => card.projectId === project.id)
-                        .sort((a, b) => a.sortOrder - b.sortOrder);
+                    const timelineCards = await db.cards
+                        .where('[projectId+sortOrder]')
+                        .between([project.id, Dexie.minKey], [project.id, Dexie.maxKey])
+                        .toArray();
 
-                    const timelineJsonCards = timelineCards.map(card => {
+                    const timelineJsonCards = [];
+                    for (const card of timelineCards) {
                         const { image, ...meta } = card;
-                        if (!image) return { ...meta, imageFileName: null };
+                        if (!image) {
+                            timelineJsonCards.push({ ...meta, imageFileName: null });
+                            continue;
+                        }
                         const ext = getImageExtensionFromMime(card.mimeType);
-                        return { ...meta, imageFileName: `card_${card.id}.${ext}` };
-                    });
+                        timelineJsonCards.push({ ...meta, imageFileName: `card_${card.id}.${ext}` });
+                    }
 
                     timelineFolder.file("timeline.json", JSON.stringify({ project, cards: timelineJsonCards }, null, 2));
 
                     for (const card of timelineCards) {
                         if (card.image) {
                             const ext = getImageExtensionFromMime(card.mimeType);
-                            const b64Data = card.image.split(',')[1];
-                            timelineFolder.file(`card_${card.id}.${ext}`, b64Data, { base64: true });
+                            const b64Data = extractBase64FromDataUrl(card.image);
+                            if (b64Data) {
+                                timelineFolder.file(`card_${card.id}.${ext}`, b64Data, { base64: true });
+                            }
                         }
                     }
                 }
@@ -407,9 +431,8 @@
                     timelineCount: projects.length
                 }, null, 2));
 
-                const content = await zip.generateAsync({type: "blob", compression: "DEFLATE"});
-                const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(content), download: `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip` });
-                a.click();
+                const content = await zip.generateAsync({ type: "blob", compression: "STORE", streamFiles: true });
+                downloadBlob(content, `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`);
             } catch (err) { alert("Backup failed: " + err.message); }
             finally { btn.innerText = "Backup All (ZIP)"; btn.disabled = false; }
         }
