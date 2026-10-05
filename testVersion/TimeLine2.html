@@ -421,57 +421,63 @@
 
         // --- STREAMING ZIP HELPERS ---
         
-        // Helper to pump a Readable stream (JSZip) to a Writable stream (File System)
-        async function pumpStreamToWritable(readableStream, writableTarget, totalBytes, onProgress, isStreamSaver = false) {
-            let processed = 0;
-            
-            return new Promise((resolve, reject) => {
-                readableStream.on('readable', async function() {
-                    let chunk;
-                    // Read all available chunks
-                    while ((chunk = this.read()) !== null) {
-                        processed += chunk.length;
-                        
-                        // Update Progress
-                        if (onProgress && totalBytes > 0) {
-                            let percent = (processed / totalBytes) * 100;
-                            // If we exceed estimate, cap at 99% until 'end' event
-                            if (percent >= 100) percent = 99; 
-                            onProgress(percent);
-                        }
+        // Async queue to handle backpressure properly
+        class AsyncWriteQueue {
+            constructor(writer, concurrency = 1) {
+                this.writer = writer;
+                this.concurrency = concurrency;
+                this.queue = [];
+                this.active = 0;
+                this.error = null;
+                this.done = false;
+                this.resolveAll = null;
+                this.allDone = new Promise(resolve => { this.resolveAll = resolve; });
+            }
 
-                        try {
-                            if (isStreamSaver) {
-                                // StreamSaver writer
-                                await writableTarget.write(chunk);
-                            } else {
-                                // Native File System API
-                                await writableTarget.write(chunk);
-                            }
-                        } catch (err) {
-                            reject(err);
-                            return;
-                        }
-                    }
+            enqueue(chunk) {
+                return new Promise((resolve, reject) => {
+                    this.queue.push({ chunk, resolve, reject });
+                    this._process();
                 });
+            }
 
-                readableStream.on('end', async function() {
+            async _process() {
+                if (this.error || this.done) return;
+                while (this.active < this.concurrency && this.queue.length > 0) {
+                    const { chunk, resolve, reject } = this.queue.shift();
+                    this.active++;
                     try {
-                        if (isStreamSaver) {
-                            await writableTarget.close();
-                        } else {
-                            await writableTarget.close();
-                        }
-                        // Final progress update
-                        if (onProgress) onProgress(100);
+                        await this.writer.write(chunk);
                         resolve();
                     } catch (err) {
+                        this.error = err;
                         reject(err);
+                        // Reject all remaining
+                        while (this.queue.length > 0) {
+                            this.queue.shift().reject(err);
+                        }
+                        this.resolveAll();
+                        return;
+                    } finally {
+                        this.active--;
                     }
-                });
+                }
+                if (this.queue.length === 0 && this.active === 0 && this.done) {
+                    this.resolveAll();
+                }
+            }
 
-                readableStream.on('error', reject);
-            });
+            finish() {
+                this.done = true;
+                if (this.queue.length === 0 && this.active === 0) {
+                    this.resolveAll();
+                }
+            }
+
+            async waitForAll() {
+                await this.allDone;
+                if (this.error) throw this.error;
+            }
         }
 
         async function streamZipToDisk(zip, filename, totalBytes, onProgress) {
@@ -493,10 +499,33 @@
             }
 
             const writable = await fileHandle.createWritable();
+            const queue = new AsyncWriteQueue(writable, 1);
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
-            
-            // Use the robust pump function
-            await pumpStreamToWritable(stream, writable, totalBytes, onProgress, false);
+            let processed = 0;
+
+            return new Promise((resolve, reject) => {
+                stream.on('data', function (chunk) {
+                    processed += chunk.length;
+                    if (onProgress && totalBytes > 0) {
+                        let percent = (processed / totalBytes) * 100;
+                        if (percent >= 100) percent = 99;
+                        onProgress(percent);
+                    }
+                    queue.enqueue(chunk).catch(reject);
+                }).on('end', async function () {
+                    queue.finish();
+                    try {
+                        await queue.waitForAll();
+                        await writable.close();
+                        if (onProgress) onProgress(100);
+                        resolve();
+                    } catch (err) {
+                        reject(err);
+                    }
+                }).on('error', function (err) {
+                    reject(err);
+                });
+            });
         }
 
         async function streamWithStreamSaver(zip, filename, totalBytes, onProgress) {
@@ -512,10 +541,33 @@
             
             const fileStream = streamSaver.createWriteStream(filename, totalBytes > 0 ? { size: totalBytes } : undefined);
             const writer = fileStream.getWriter();
+            const queue = new AsyncWriteQueue(writer, 1);
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
-            
-            // Use the robust pump function
-            await pumpStreamToWritable(stream, writer, totalBytes, onProgress, true);
+            let processed = 0;
+
+            return new Promise((resolve, reject) => {
+                stream.on('data', function (chunk) {
+                    processed += chunk.length;
+                    if (onProgress && totalBytes > 0) {
+                        let percent = (processed / totalBytes) * 100;
+                        if (percent >= 100) percent = 99;
+                        onProgress(percent);
+                    }
+                    queue.enqueue(chunk).catch(reject);
+                }).on('end', async function () {
+                    queue.finish();
+                    try {
+                        await queue.waitForAll();
+                        await writer.close();
+                        if (onProgress) onProgress(100);
+                        resolve();
+                    } catch (err) {
+                        reject(err);
+                    }
+                }).on('error', function (err) {
+                    reject(err);
+                });
+            });
         }
 
         // --- EXPORT FUNCTIONS ---
@@ -600,7 +652,6 @@
                 showProgress("Streaming to Disk", "Writing ZIP file. Do not close this tab.", 60);
 
                 await streamZipToDisk(zip, filename, totalBytes, (percent) => {
-                    // If percent is 99 (capped), show "Finalizing"
                     const detail = percent >= 99 ? "Finalizing ZIP structure..." : `Writing ZIP file... (${Math.round(percent)}%)`;
                     showProgress("Streaming to Disk", detail, 60 + (percent * 0.4));
                 });
@@ -742,7 +793,6 @@
             try {
                 showProgress("Reading Backup", "Analyzing ZIP file structure...", 10);
                 
-                // Pass the File object directly to JSZip to avoid loading the entire file into memory via FileReader
                 const zipInstance = await JSZip.loadAsync(file, {
                     onProgress: function (metadata) {
                         if (metadata.percent) {
@@ -871,7 +921,7 @@
             } finally {
                 btn.innerText = originalText;
                 btn.disabled = false;
-                ev.target.value = ''; // Reset file input
+                ev.target.value = '';
             }
         }
 
