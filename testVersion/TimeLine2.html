@@ -176,7 +176,7 @@
                 <div class="vault-card rounded-2xl overflow-hidden ${!showAllButtons ? 'hidden-options' : ''}">
                     <div class="p-2 border-b border-white/5 bg-black/20 flex justify-between items-center btn-opt">
                         <div class="flex items-center gap-2">
-                            <span class="drag-handle text-slate-400 hover:text-blue-400 p-1">⠿</span>
+                            <span class="drag-handle text-slate-400 hover:text-blue-400 p-1"></span>
                             <span class="text-[10px] text-slate-300 italic font-mono">ID: ${card.id}</span>
                         </div>
                         <button onclick="deleteCard(${card.id})" class="text-red-400 text-[10px] font-bold uppercase bg-red-900/30 px-2 py-1 rounded">Delete</button>
@@ -421,65 +421,6 @@
 
         // --- STREAMING ZIP HELPERS ---
         
-        // Async queue to handle backpressure properly
-        class AsyncWriteQueue {
-            constructor(writer, concurrency = 1) {
-                this.writer = writer;
-                this.concurrency = concurrency;
-                this.queue = [];
-                this.active = 0;
-                this.error = null;
-                this.done = false;
-                this.resolveAll = null;
-                this.allDone = new Promise(resolve => { this.resolveAll = resolve; });
-            }
-
-            enqueue(chunk) {
-                return new Promise((resolve, reject) => {
-                    this.queue.push({ chunk, resolve, reject });
-                    this._process();
-                });
-            }
-
-            async _process() {
-                if (this.error || this.done) return;
-                while (this.active < this.concurrency && this.queue.length > 0) {
-                    const { chunk, resolve, reject } = this.queue.shift();
-                    this.active++;
-                    try {
-                        await this.writer.write(chunk);
-                        resolve();
-                    } catch (err) {
-                        this.error = err;
-                        reject(err);
-                        // Reject all remaining
-                        while (this.queue.length > 0) {
-                            this.queue.shift().reject(err);
-                        }
-                        this.resolveAll();
-                        return;
-                    } finally {
-                        this.active--;
-                    }
-                }
-                if (this.queue.length === 0 && this.active === 0 && this.done) {
-                    this.resolveAll();
-                }
-            }
-
-            finish() {
-                this.done = true;
-                if (this.queue.length === 0 && this.active === 0) {
-                    this.resolveAll();
-                }
-            }
-
-            async waitForAll() {
-                await this.allDone;
-                if (this.error) throw this.error;
-            }
-        }
-
         async function streamZipToDisk(zip, filename, totalBytes, onProgress) {
             let fileHandle;
             try {
@@ -499,9 +440,9 @@
             }
 
             const writable = await fileHandle.createWritable();
-            const queue = new AsyncWriteQueue(writable, 1);
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
             let processed = 0;
+            let writePromise = Promise.resolve();
 
             return new Promise((resolve, reject) => {
                 stream.on('data', function (chunk) {
@@ -511,11 +452,11 @@
                         if (percent >= 100) percent = 99;
                         onProgress(percent);
                     }
-                    queue.enqueue(chunk).catch(reject);
+                    // Chain writes without awaiting - let the browser handle buffering
+                    writePromise = writePromise.then(() => writable.write(chunk)).catch(reject);
                 }).on('end', async function () {
-                    queue.finish();
                     try {
-                        await queue.waitForAll();
+                        await writePromise;
                         await writable.close();
                         if (onProgress) onProgress(100);
                         resolve();
@@ -541,9 +482,9 @@
             
             const fileStream = streamSaver.createWriteStream(filename, totalBytes > 0 ? { size: totalBytes } : undefined);
             const writer = fileStream.getWriter();
-            const queue = new AsyncWriteQueue(writer, 1);
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
             let processed = 0;
+            let writePromise = Promise.resolve();
 
             return new Promise((resolve, reject) => {
                 stream.on('data', function (chunk) {
@@ -553,11 +494,11 @@
                         if (percent >= 100) percent = 99;
                         onProgress(percent);
                     }
-                    queue.enqueue(chunk).catch(reject);
+                    // Chain writes without awaiting - let the browser handle buffering
+                    writePromise = writePromise.then(() => writer.write(chunk)).catch(reject);
                 }).on('end', async function () {
-                    queue.finish();
                     try {
-                        await queue.waitForAll();
+                        await writePromise;
                         await writer.close();
                         if (onProgress) onProgress(100);
                         resolve();
