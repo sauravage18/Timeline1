@@ -420,6 +420,60 @@
         }
 
         // --- STREAMING ZIP HELPERS ---
+        
+        // Helper to pump a Readable stream (JSZip) to a Writable stream (File System)
+        async function pumpStreamToWritable(readableStream, writableTarget, totalBytes, onProgress, isStreamSaver = false) {
+            let processed = 0;
+            
+            return new Promise((resolve, reject) => {
+                readableStream.on('readable', async function() {
+                    let chunk;
+                    // Read all available chunks
+                    while ((chunk = this.read()) !== null) {
+                        processed += chunk.length;
+                        
+                        // Update Progress
+                        if (onProgress && totalBytes > 0) {
+                            let percent = (processed / totalBytes) * 100;
+                            // If we exceed estimate, cap at 99% until 'end' event
+                            if (percent >= 100) percent = 99; 
+                            onProgress(percent);
+                        }
+
+                        try {
+                            if (isStreamSaver) {
+                                // StreamSaver writer
+                                await writableTarget.write(chunk);
+                            } else {
+                                // Native File System API
+                                await writableTarget.write(chunk);
+                            }
+                        } catch (err) {
+                            reject(err);
+                            return;
+                        }
+                    }
+                });
+
+                readableStream.on('end', async function() {
+                    try {
+                        if (isStreamSaver) {
+                            await writableTarget.close();
+                        } else {
+                            await writableTarget.close();
+                        }
+                        // Final progress update
+                        if (onProgress) onProgress(100);
+                        resolve();
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+
+                readableStream.on('error', reject);
+            });
+        }
+
         async function streamZipToDisk(zip, filename, totalBytes, onProgress) {
             let fileHandle;
             try {
@@ -440,23 +494,9 @@
 
             const writable = await fileHandle.createWritable();
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
-            let processed = 0;
             
-            return new Promise((resolve, reject) => {
-                stream.on('data', function (chunk) {
-                    processed += chunk.length;
-                    if (onProgress && totalBytes > 0) {
-                        const percent = Math.min(100, (processed / totalBytes) * 100);
-                        onProgress(percent);
-                    }
-                    writable.write(chunk).catch(reject);
-                }).on('end', function () {
-                    writable.close().then(resolve).catch(reject);
-                }).on('error', function (err) {
-                    reject(err);
-                });
-                stream.resume();
-            });
+            // Use the robust pump function
+            await pumpStreamToWritable(stream, writable, totalBytes, onProgress, false);
         }
 
         async function streamWithStreamSaver(zip, filename, totalBytes, onProgress) {
@@ -471,30 +511,11 @@
             }
             
             const fileStream = streamSaver.createWriteStream(filename, totalBytes > 0 ? { size: totalBytes } : undefined);
-            // FIX: Get the writer from the WritableStream
-            const writer = fileStream.getWriter(); 
-            
+            const writer = fileStream.getWriter();
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
-            let processed = 0;
             
-            return new Promise((resolve, reject) => {
-                stream.on('data', function (chunk) {
-                    processed += chunk.length;
-                    if (onProgress && totalBytes > 0) {
-                        const percent = Math.min(100, (processed / totalBytes) * 100);
-                        onProgress(percent);
-                    }
-                    // FIX: Use writer.write instead of fileStream.write
-                    writer.write(chunk).catch(reject);
-                }).on('end', function () {
-                    // FIX: Close the writer
-                    writer.close();
-                    resolve();
-                }).on('error', function (err) {
-                    reject(err);
-                });
-                stream.resume();
-            });
+            // Use the robust pump function
+            await pumpStreamToWritable(stream, writer, totalBytes, onProgress, true);
         }
 
         // --- EXPORT FUNCTIONS ---
@@ -576,10 +597,12 @@
                 zip.file("backup_manifest.json", manifestStr);
 
                 const filename = `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`;
-                showProgress("Streaming to Disk", "Writing ZIP file. Do not close this tab. This may take a while for large backups.", 60);
+                showProgress("Streaming to Disk", "Writing ZIP file. Do not close this tab.", 60);
 
                 await streamZipToDisk(zip, filename, totalBytes, (percent) => {
-                    showProgress("Streaming to Disk", `Writing ZIP file... (${Math.round(percent)}%)`, 60 + (percent * 0.4));
+                    // If percent is 99 (capped), show "Finalizing"
+                    const detail = percent >= 99 ? "Finalizing ZIP structure..." : `Writing ZIP file... (${Math.round(percent)}%)`;
+                    showProgress("Streaming to Disk", detail, 60 + (percent * 0.4));
                 });
 
                 showProgress("Complete", "Backup finished successfully!", 100, true);
@@ -660,7 +683,8 @@
                 showProgress("Streaming to Disk", "Writing ZIP file. Do not close this tab.", 60);
 
                 await streamZipToDisk(zip, filename, totalBytes, (percent) => {
-                    showProgress("Streaming to Disk", `Writing ZIP file... (${Math.round(percent)}%)`, 60 + (percent * 0.4));
+                    const detail = percent >= 99 ? "Finalizing ZIP structure..." : `Writing ZIP file... (${Math.round(percent)}%)`;
+                    showProgress("Streaming to Disk", detail, 60 + (percent * 0.4));
                 });
 
                 showProgress("Complete", "Backup finished successfully!", 100, true);
