@@ -471,6 +471,9 @@
             }
             
             const fileStream = streamSaver.createWriteStream(filename, totalBytes > 0 ? { size: totalBytes } : undefined);
+            // FIX: Get the writer from the WritableStream
+            const writer = fileStream.getWriter(); 
+            
             const stream = zip.generateInternalStream({ type: "uint8array", compression: "STORE", streamFiles: true });
             let processed = 0;
             
@@ -481,9 +484,11 @@
                         const percent = Math.min(100, (processed / totalBytes) * 100);
                         onProgress(percent);
                     }
-                    fileStream.write(chunk);
+                    // FIX: Use writer.write instead of fileStream.write
+                    writer.write(chunk).catch(reject);
                 }).on('end', function () {
-                    fileStream.close();
+                    // FIX: Close the writer
+                    writer.close();
                     resolve();
                 }).on('error', function (err) {
                     reject(err);
