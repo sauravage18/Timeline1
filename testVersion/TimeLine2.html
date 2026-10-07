@@ -439,13 +439,15 @@
                         streamFiles: true
                     });
                     stream.on('data', function (chunk) {
-                        // Transfer ArrayBuffer to main thread to keep worker memory flat (prevents phone hangs)
                         self.postMessage({ type: 'chunk', data: chunk.buffer }, [chunk.buffer]);
                     }).on('end', function () {
                         self.postMessage({ type: 'done', id: msg.id });
                     }).on('error', function (err) {
                         self.postMessage({ type: 'error', id: msg.id, error: err.message });
                     });
+                    
+                    // CRITICAL FIX: The stream must be manually started!
+                    stream.resume();
                 }
             };
         `;
@@ -469,7 +471,6 @@
                         workerResolvers.delete(msg.id);
                     }
                 } else if (msg.type === 'chunk') {
-                    // Main thread writes chunk directly to disk, keeping RAM usage near zero
                     const chunk = new Uint8Array(msg.data);
                     writePromise = writePromise.then(() => writer.write(chunk));
                 } else if (msg.type === 'status') {
@@ -489,22 +490,39 @@
             }
 
             try {
-                const fileStream = streamSaver.createWriteStream(filename);
-                writer = fileStream.getWriter();
+                // Try Native File System API first (Best for local files / Chrome / Edge)
+                if (window.showSaveFilePicker) {
+                    const fileHandle = await window.showSaveFilePicker({
+                        suggestedName: filename,
+                        types: [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }]
+                    });
+                    writer = await fileHandle.createWritable();
+                } else {
+                    // Fallback to StreamSaver
+                    const fileStream = streamSaver.createWriteStream(filename);
+                    writer = fileStream.getWriter();
+                }
             } catch (err) {
-                worker.terminate();
-                throw new Error("StreamSaver initialization failed. Please use a modern browser like Chrome or Edge for large backups.");
+                if (err.name === 'AbortError') {
+                    worker.terminate();
+                    throw new Error("Backup cancelled by user.");
+                }
+                // If Native FS fails, try StreamSaver as backup
+                try {
+                    const fileStream = streamSaver.createWriteStream(filename);
+                    writer = fileStream.getWriter();
+                } catch (e2) {
+                    worker.terminate();
+                    throw new Error("Download initialization failed. Please use Chrome or Edge.");
+                }
             }
 
-            // Let the caller add files to the worker
             await addFilesCallback(sendToWorker);
 
             showProgress("Streaming to Disk", "Writing ZIP file. Do not close this tab.", 60);
             
-            // Trigger generation and wait for completion
             await sendToWorker({ type: 'generate' });
             
-            // Ensure all disk writes are finished
             await writePromise;
             await writer.close();
             
@@ -533,7 +551,6 @@
                 let processedProjects = 0;
 
                 await runWorkerBackup(filename, async (sendToWorker) => {
-                    // Add Manifest
                     const manifestStr = JSON.stringify({ version: 2, format: "timeline-folders", createdAt: new Date().toISOString(), timelineCount: projects.length }, null, 2);
                     await sendToWorker({ type: 'add', name: "backup_manifest.json", data: manifestStr, isBase64: false });
 
@@ -565,7 +582,6 @@
                         const jsonStr = JSON.stringify({ project, cards: timelineJsonCards }, null, 2);
                         await sendToWorker({ type: 'add', name: `${folderName}/timeline.json`, data: jsonStr, isBase64: false });
 
-                        // Yield to main thread to prevent UI freeze
                         await new Promise(r => setTimeout(r, 0));
 
                         const imagesToAdd = timelineCards.filter(c => c.image);
@@ -581,7 +597,6 @@
                                     isBase64: true 
                                 });
                             }
-                            // Yield every 3 images to keep main thread responsive
                             if (j % 3 === 0) {
                                 await new Promise(r => setTimeout(r, 0));
                             }
@@ -630,11 +645,9 @@
                 const filename = `${safeTimelineName}-Backup-${new Date().toISOString().slice(0,10)}.zip`;
 
                 await runWorkerBackup(filename, async (sendToWorker) => {
-                    // Add Manifest
                     const manifestStr = JSON.stringify({ version: 2, format: "timeline-folders", createdAt: new Date().toISOString(), timelineCount: 1 }, null, 2);
                     await sendToWorker({ type: 'add', name: "backup_manifest.json", data: manifestStr, isBase64: false });
 
-                    // Add Timeline JSON
                     const timelineJsonCards = timelineCards.map(card => {
                         const { image, ...meta } = card;
                         if (!image) return { ...meta, imageFileName: null };
@@ -644,7 +657,6 @@
                     const jsonStr = JSON.stringify({ project, cards: timelineJsonCards }, null, 2);
                     await sendToWorker({ type: 'add', name: `${folderName}/timeline.json`, data: jsonStr, isBase64: false });
 
-                    // Add Images sequentially with memory management
                     const imagesToAdd = timelineCards.filter(c => c.image);
                     for (let j = 0; j < imagesToAdd.length; j++) {
                         const card = imagesToAdd[j];
@@ -653,7 +665,6 @@
                         if (b64Data) {
                             showProgress("Reading Files", `Processing ${j + 1}/${imagesToAdd.length}`, 10 + (j / imagesToAdd.length) * 40);
                             
-                            // Yield to main thread to prevent UI freeze
                             await new Promise(r => setTimeout(r, 0));
                             
                             await sendToWorker({ 
@@ -833,7 +844,6 @@
                                     await db.cards.add(card);
                                     
                                     processedCards++;
-                                    // Yield to main thread every 10 cards to prevent UI hangs during large restores
                                     if (processedCards % 10 === 0 || processedCards === totalCards) {
                                         await new Promise(r => setTimeout(r, 0));
                                         showProgress("Restoring Data", `Restoring cards... (${processedCards}/${totalCards})`, 60 + (processedCards / totalCards) * 35);
