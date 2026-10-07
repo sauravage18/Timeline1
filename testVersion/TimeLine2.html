@@ -8,7 +8,7 @@
     <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.js"></script>
+    <!-- StreamSaver removed as it causes hanging on mobile/local files -->
     <style>
         body { background: #52527a; color: #eeeeee; background-attachment: fixed; }
         .hidden-options .btn-opt { display: none !important; }
@@ -400,6 +400,17 @@
             return dataUrl.slice(commaIndex + 1);
         }
 
+        function downloadBlob(blob, fileName) {
+            const objectUrl = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = objectUrl;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+        }
+
         // --- PROGRESS DIALOG HELPERS ---
         function showProgress(title, detail, percent, hideSpinner = false) {
             const dialog = document.getElementById('progressDialog');
@@ -420,115 +431,8 @@
         }
 
         // ==========================================
-        // 2. CRASH-PROOF WORKER-BASED BACKUP ENGINE
+        // 2. BULLETPROOF NATIVE ZIP EXPORT
         // ==========================================
-        const backupWorkerCode = `
-            importScripts('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
-            let zip = new JSZip();
-            
-            self.onmessage = function(e) {
-                const msg = e.data;
-                if (msg.type === 'add') {
-                    zip.file(msg.name, msg.data, { base64: msg.isBase64 });
-                    self.postMessage({ type: 'added', id: msg.id });
-                } else if (msg.type === 'generate') {
-                    self.postMessage({ type: 'status', id: msg.id, status: 'Compressing...' });
-                    const stream = zip.generateInternalStream({
-                        type: 'uint8array',
-                        compression: 'STORE',
-                        streamFiles: true
-                    });
-                    stream.on('data', function (chunk) {
-                        self.postMessage({ type: 'chunk', data: chunk.buffer }, [chunk.buffer]);
-                    }).on('end', function () {
-                        self.postMessage({ type: 'done', id: msg.id });
-                    }).on('error', function (err) {
-                        self.postMessage({ type: 'error', id: msg.id, error: err.message });
-                    });
-                    
-                    // CRITICAL FIX: The stream must be manually started!
-                    stream.resume();
-                }
-            };
-        `;
-
-        async function runWorkerBackup(filename, addFilesCallback) {
-            const workerBlob = new Blob([backupWorkerCode], { type: 'application/javascript' });
-            const worker = new Worker(URL.createObjectURL(workerBlob));
-
-            let workerResolvers = new Map();
-            let messageId = 0;
-            let writePromise = Promise.resolve();
-            let writer = null;
-
-            worker.onmessage = (e) => {
-                const msg = e.data;
-                if (msg.type === 'added' || msg.type === 'done' || msg.type === 'error') {
-                    const resolve = workerResolvers.get(msg.id);
-                    if (resolve) {
-                        if (msg.type === 'error') resolve(new Error(msg.error));
-                        else resolve(msg);
-                        workerResolvers.delete(msg.id);
-                    }
-                } else if (msg.type === 'chunk') {
-                    const chunk = new Uint8Array(msg.data);
-                    writePromise = writePromise.then(() => writer.write(chunk));
-                } else if (msg.type === 'status') {
-                    showProgress("Streaming to Disk", msg.status, 70);
-                }
-            };
-
-            function sendToWorker(msg) {
-                return new Promise((resolve, reject) => {
-                    const id = ++messageId;
-                    workerResolvers.set(id, (result) => {
-                        if (result instanceof Error) reject(result);
-                        else resolve(result);
-                    });
-                    worker.postMessage({ ...msg, id });
-                });
-            }
-
-            try {
-                // Try Native File System API first (Best for local files / Chrome / Edge)
-                if (window.showSaveFilePicker) {
-                    const fileHandle = await window.showSaveFilePicker({
-                        suggestedName: filename,
-                        types: [{ description: 'ZIP Archive', accept: { 'application/zip': ['.zip'] } }]
-                    });
-                    writer = await fileHandle.createWritable();
-                } else {
-                    // Fallback to StreamSaver
-                    const fileStream = streamSaver.createWriteStream(filename);
-                    writer = fileStream.getWriter();
-                }
-            } catch (err) {
-                if (err.name === 'AbortError') {
-                    worker.terminate();
-                    throw new Error("Backup cancelled by user.");
-                }
-                // If Native FS fails, try StreamSaver as backup
-                try {
-                    const fileStream = streamSaver.createWriteStream(filename);
-                    writer = fileStream.getWriter();
-                } catch (e2) {
-                    worker.terminate();
-                    throw new Error("Download initialization failed. Please use Chrome or Edge.");
-                }
-            }
-
-            await addFilesCallback(sendToWorker);
-
-            showProgress("Streaming to Disk", "Writing ZIP file. Do not close this tab.", 60);
-            
-            await sendToWorker({ type: 'generate' });
-            
-            await writePromise;
-            await writer.close();
-            
-            worker.terminate();
-        }
-
         async function exportAllData() {
             const btn = document.getElementById('exportBtn');
             const originalText = btn.innerText;
@@ -544,67 +448,68 @@
                 }
 
                 showProgress("Preparing Backup", "Gathering timeline data...", 5);
-                
-                const filename = `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`;
+                const zip = new JSZip();
                 const usedFolderNames = new Set();
                 let totalProjects = projects.length;
                 let processedProjects = 0;
 
-                await runWorkerBackup(filename, async (sendToWorker) => {
-                    const manifestStr = JSON.stringify({ version: 2, format: "timeline-folders", createdAt: new Date().toISOString(), timelineCount: projects.length }, null, 2);
-                    await sendToWorker({ type: 'add', name: "backup_manifest.json", data: manifestStr, isBase64: false });
+                const manifestStr = JSON.stringify({ version: 2, format: "timeline-folders", createdAt: new Date().toISOString(), timelineCount: projects.length }, null, 2);
+                zip.file("backup_manifest.json", manifestStr);
 
-                    for (let i = 0; i < projects.length; i++) {
-                        const project = projects[i];
-                        processedProjects++;
-                        showProgress("Gathering Data", `Processing timeline: ${project.title} (${processedProjects}/${totalProjects})`, 5 + (processedProjects / totalProjects) * 45);
-                        
-                        const baseName = sanitizeTimelineFolderName(project.title);
-                        let folderName = baseName;
-                        let counter = 2;
-                        while (usedFolderNames.has(folderName)) {
-                            folderName = `${baseName}-${counter++}`;
-                        }
-                        usedFolderNames.add(folderName);
-
-                        const timelineCards = await db.cards
-                            .where('[projectId+sortOrder]')
-                            .between([project.id, Dexie.minKey], [project.id, Dexie.maxKey])
-                            .toArray();
-
-                        const timelineJsonCards = timelineCards.map(card => {
-                            const { image, ...meta } = card;
-                            if (!image) return { ...meta, imageFileName: null };
-                            const ext = getImageExtensionFromMime(card.mimeType);
-                            return { ...meta, imageFileName: `card_${card.id}.${ext}` };
-                        });
-
-                        const jsonStr = JSON.stringify({ project, cards: timelineJsonCards }, null, 2);
-                        await sendToWorker({ type: 'add', name: `${folderName}/timeline.json`, data: jsonStr, isBase64: false });
-
-                        await new Promise(r => setTimeout(r, 0));
-
-                        const imagesToAdd = timelineCards.filter(c => c.image);
-                        for (let j = 0; j < imagesToAdd.length; j++) {
-                            const card = imagesToAdd[j];
-                            const ext = getImageExtensionFromMime(card.mimeType);
-                            const b64Data = extractBase64FromDataUrl(card.image);
-                            if (b64Data) {
-                                await sendToWorker({ 
-                                    type: 'add', 
-                                    name: `${folderName}/card_${card.id}.${ext}`, 
-                                    data: b64Data, 
-                                    isBase64: true 
-                                });
-                            }
-                            if (j % 3 === 0) {
-                                await new Promise(r => setTimeout(r, 0));
-                            }
-                        }
+                for (let i = 0; i < projects.length; i++) {
+                    const project = projects[i];
+                    processedProjects++;
+                    const progressPercent = 5 + (processedProjects / totalProjects) * 45;
+                    showProgress("Gathering Data", `Processing timeline: ${project.title} (${processedProjects}/${totalProjects})`, progressPercent);
+                    
+                    const baseName = sanitizeTimelineFolderName(project.title);
+                    let folderName = baseName;
+                    let counter = 2;
+                    while (usedFolderNames.has(folderName)) {
+                        folderName = `${baseName}-${counter++}`;
                     }
+                    usedFolderNames.add(folderName);
+
+                    const timelineCards = await db.cards
+                        .where('[projectId+sortOrder]')
+                        .between([project.id, Dexie.minKey], [project.id, Dexie.maxKey])
+                        .toArray();
+
+                    const timelineJsonCards = timelineCards.map(card => {
+                        const { image, ...meta } = card;
+                        if (!image) return { ...meta, imageFileName: null };
+                        const ext = getImageExtensionFromMime(card.mimeType);
+                        return { ...meta, imageFileName: `card_${card.id}.${ext}` };
+                    });
+
+                    const jsonStr = JSON.stringify({ project, cards: timelineJsonCards }, null, 2);
+                    zip.file(`${folderName}/timeline.json`, jsonStr);
+
+                    await new Promise(r => setTimeout(r, 0)); // Yield to UI
+
+                    const imagesToAdd = timelineCards.filter(c => c.image);
+                    for (let j = 0; j < imagesToAdd.length; j++) {
+                        const card = imagesToAdd[j];
+                        const ext = getImageExtensionFromMime(card.mimeType);
+                        const b64Data = extractBase64FromDataUrl(card.image);
+                        if (b64Data) {
+                            zip.file(`${folderName}/card_${card.id}.${ext}`, b64Data, { base64: true });
+                        }
+                        if (j % 5 === 0) await new Promise(r => setTimeout(r, 0));
+                    }
+                }
+
+                showProgress("Compressing", "Creating ZIP file... This may take a moment.", 60);
+                await new Promise(r => setTimeout(r, 50)); // Let UI update
+
+                // Native bulletproof generation
+                const blob = await zip.generateAsync({ type: 'blob' }, function(metadata) {
+                    showProgress("Compressing", `Finalizing ZIP... ${Math.round(metadata.percent)}%`, 60 + (metadata.percent * 0.4));
                 });
 
-                showProgress("Complete", "Backup finished successfully!", 100, true);
+                showProgress("Downloading", "Saving to your device...", 100);
+                downloadBlob(blob, `Vault-Backup-${new Date().toISOString().slice(0,10)}.zip`);
+
                 setTimeout(() => {
                     hideProgress();
                     window.isBackupRunning = false;
@@ -640,44 +545,48 @@
                     .between([currentProjectId, Dexie.minKey], [currentProjectId, Dexie.maxKey])
                     .toArray();
 
+                const zip = new JSZip();
                 const folderName = sanitizeTimelineFolderName(project.title);
                 const safeTimelineName = folderName.replace(/\s+/g, "-");
                 const filename = `${safeTimelineName}-Backup-${new Date().toISOString().slice(0,10)}.zip`;
 
-                await runWorkerBackup(filename, async (sendToWorker) => {
-                    const manifestStr = JSON.stringify({ version: 2, format: "timeline-folders", createdAt: new Date().toISOString(), timelineCount: 1 }, null, 2);
-                    await sendToWorker({ type: 'add', name: "backup_manifest.json", data: manifestStr, isBase64: false });
+                const manifestStr = JSON.stringify({ version: 2, format: "timeline-folders", createdAt: new Date().toISOString(), timelineCount: 1 }, null, 2);
+                zip.file("backup_manifest.json", manifestStr);
 
-                    const timelineJsonCards = timelineCards.map(card => {
-                        const { image, ...meta } = card;
-                        if (!image) return { ...meta, imageFileName: null };
-                        const ext = getImageExtensionFromMime(card.mimeType);
-                        return { ...meta, imageFileName: `card_${card.id}.${ext}` };
-                    });
-                    const jsonStr = JSON.stringify({ project, cards: timelineJsonCards }, null, 2);
-                    await sendToWorker({ type: 'add', name: `${folderName}/timeline.json`, data: jsonStr, isBase64: false });
-
-                    const imagesToAdd = timelineCards.filter(c => c.image);
-                    for (let j = 0; j < imagesToAdd.length; j++) {
-                        const card = imagesToAdd[j];
-                        const ext = getImageExtensionFromMime(card.mimeType);
-                        const b64Data = extractBase64FromDataUrl(card.image);
-                        if (b64Data) {
-                            showProgress("Reading Files", `Processing ${j + 1}/${imagesToAdd.length}`, 10 + (j / imagesToAdd.length) * 40);
-                            
-                            await new Promise(r => setTimeout(r, 0));
-                            
-                            await sendToWorker({ 
-                                type: 'add', 
-                                name: `${folderName}/card_${card.id}.${ext}`, 
-                                data: b64Data, 
-                                isBase64: true 
-                            });
-                        }
-                    }
+                const timelineJsonCards = timelineCards.map(card => {
+                    const { image, ...meta } = card;
+                    if (!image) return { ...meta, imageFileName: null };
+                    const ext = getImageExtensionFromMime(card.mimeType);
+                    return { ...meta, imageFileName: `card_${card.id}.${ext}` };
                 });
 
-                showProgress("Complete", "Backup finished successfully!", 100, true);
+                const jsonStr = JSON.stringify({ project, cards: timelineJsonCards }, null, 2);
+                zip.file(`${folderName}/timeline.json`, jsonStr);
+
+                await new Promise(r => setTimeout(r, 0)); // Yield to UI
+
+                const imagesToAdd = timelineCards.filter(c => c.image);
+                for (let j = 0; j < imagesToAdd.length; j++) {
+                    const card = imagesToAdd[j];
+                    const ext = getImageExtensionFromMime(card.mimeType);
+                    const b64Data = extractBase64FromDataUrl(card.image);
+                    if (b64Data) {
+                        zip.file(`${folderName}/card_${card.id}.${ext}`, b64Data, { base64: true });
+                    }
+                    if (j % 5 === 0) await new Promise(r => setTimeout(r, 0));
+                }
+
+                showProgress("Compressing", "Creating ZIP file...", 60);
+                await new Promise(r => setTimeout(r, 50)); // Let UI update
+
+                // Native bulletproof generation
+                const blob = await zip.generateAsync({ type: 'blob' }, function(metadata) {
+                    showProgress("Compressing", `Finalizing ZIP... ${Math.round(metadata.percent)}%`, 60 + (metadata.percent * 0.4));
+                });
+
+                showProgress("Downloading", "Saving to your device...", 100);
+                downloadBlob(blob, filename);
+
                 setTimeout(() => {
                     hideProgress();
                     window.isBackupRunning = false;
