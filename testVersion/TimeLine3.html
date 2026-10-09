@@ -1,0 +1,1440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+     
+    <title>Timeline</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <style>
+        body { background: #52527a; color: #eeeeee; background-attachment: fixed; }
+        .hidden-options .btn-opt { display: none !important; }
+        .hidden-options .keep-visible { display: flex !important; }
+        .image-container img { width: 100%; display: block; background: #0f172a; transition: all 0.3s ease; }
+        .img-wrapped { height: 200px !important; object-fit: cover; }
+        .img-unwrapped { height: auto !important; object-fit: contain; }
+        .auto-expand { overflow: hidden; min-height: 80px; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .sortable-ghost { opacity: 0.3; background: #312e81; border: 2px dashed #6366f1; }
+        .drag-handle { cursor: grab; }
+        .vault-card {
+            background: linear-gradient(145deg, #5138c7 0%, #6246ea 45%, #b94343 100%);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+            color: white;
+        }
+        @keyframes copySuccess {
+            0% { background-color: transparent; }
+            50% { background-color: rgba(16, 185, 129, 0.2); }
+            100% { background-color: transparent; }
+        }
+        .copy-flash { animation: copySuccess 0.6s ease-in-out; }
+    </style>
+</head>
+<body class="min-h-screen pb-10">
+
+    <div id="dashboard" class="max-w-2xl mx-auto p-4">
+        <div class="flex justify-between items-center mb-6 mt-4">
+            <h1 class="text-2xl font-black text-white tracking-tight">Timeline Vault</h1>
+            <div class="flex gap-2">
+                <button onclick="exportAllData()" id="exportBtn" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors disabled:opacity-60">Backup All (ZIP)</button>
+                <button onclick="triggerRestore()" id="restoreBtn" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-lg text-xs font-bold uppercase shadow-lg transition-colors disabled:opacity-60">Restore All</button>
+            </div>
+        </div>
+        <div class="mb-6">
+            <input type="text" id="projectSearch" oninput="renderProjects()" placeholder="Search timelines..." 
+                class="w-full p-3 rounded-xl bg-slate-900/50 border border-slate-700 text-white shadow-inner outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div id="projectList" class="grid gap-4"></div>
+        <button onclick="createNewProject()" class="w-full mt-8 border-2 border-dashed border-slate-700 p-8 rounded-2xl text-slate-500 font-bold hover:bg-white/5 hover:text-slate-300 transition-all">
+            + Create New Timeline
+        </button>
+    </div>
+
+    <div id="editor" class="hidden">
+        <header class="sticky top-0 bg-slate-950/80 backdrop-blur-xl shadow-2xl border-b border-white/10 p-3 z-30">
+            <div class="max-w-2xl mx-auto flex flex-col gap-3">
+                <div class="flex items-center gap-2">
+                    <button onclick="showDashboard()" class="text-blue-400 font-bold pr-2 border-r border-white/10">← Back</button>
+                    <input id="projectTitleInput" type="text" class="bg-transparent p-1 text-xl font-bold focus:outline-none flex-grow text-white">
+                </div>
+                <div class="flex gap-2 overflow-x-auto no-scrollbar">
+                    <button onclick="toggleOptions()" id="toggleBtn" class="whitespace-nowrap bg-blue-900/40 border border-blue-400/30 text-white px-4 py-2 rounded-lg text-xs font-bold uppercase">Show Options</button>
+                    <button onclick="toggleWrap()" id="wrapBtn" class="whitespace-nowrap text-white px-4 py-2 rounded-lg text-xs font-bold uppercase">Wrap Content</button>
+                    <button onclick="deleteCurrentProject()" class="whitespace-nowrap bg-red-900/20 text-red-400 border border-red-900/40 px-4 py-2 rounded-lg text-xs font-bold uppercase">Delete</button>
+                </div>
+            </div>
+        </header>
+        <main class="max-w-2xl mx-auto mt-4 px-3" id="cardContainer"></main>
+        <div id="timelineActions" class="max-w-2xl mx-auto mt-2 px-3 pb-6 hidden">
+            <div class="vault-card rounded-2xl p-3 border border-white/10">
+                <div class="flex flex-col sm:flex-row gap-2">
+                    <button onclick="exportCurrentTimeline()" id="exportCurrentBtn" class="flex-1 bg-emerald-700/80 hover:bg-emerald-600 text-white px-4 py-3 rounded-xl text-xs font-bold uppercase shadow-lg transition-colors disabled:opacity-60">Backup This Timeline (ZIP)</button>
+                    <button onclick="copyCurrentTimelineAllText()" id="copyTimelineTextBtn" class="flex-1 bg-slate-900/70 hover:bg-slate-800 text-white px-4 py-3 rounded-xl text-xs font-bold uppercase border border-white/10 transition-colors">Copy All Timeline Text</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <input type="file" id="restoreFile" class="hidden" accept=".zip,.json,application/zip,application/json" onchange="importAllData(event)">
+
+    <div id="ioOverlay" hidden class="hidden fixed inset-0 z-50 bg-black/75 flex items-end sm:items-center justify-center p-4">
+        <div class="w-full max-w-md bg-slate-950 border border-white/15 rounded-2xl p-5 shadow-2xl">
+            <p id="ioTitle" class="text-white font-bold text-lg">Working</p>
+            <p id="ioDetail" class="text-slate-300 text-sm mt-2 min-h-[2.5rem]">Preparing…</p>
+            <div class="mt-4 h-2 rounded-full bg-slate-800 overflow-hidden">
+                <div id="ioBar" class="h-full bg-emerald-500 transition-all duration-150" style="width:0%"></div>
+            </div>
+            <p class="text-[11px] text-slate-400 mt-3">Keep this page open. Large backups are written straight to a file so the phone does not have to hold the whole archive.</p>
+        </div>
+    </div>
+
+    <script>
+        const db = new Dexie("MultiTimelineDB");
+        db.version(5).stores({
+            projects: '++id, title, lastModified, isWrapped',
+            cards: '++id, projectId, sortOrder, [projectId+sortOrder]' 
+        });
+
+        let currentProjectId = null;
+        let showAllButtons = false;
+        let sortableInstance = null;
+
+        async function init() { renderProjects(); }
+
+        async function renderProjects() {
+            const query = document.getElementById('projectSearch').value.toLowerCase();
+            const projects = await db.projects.orderBy('lastModified').reverse().toArray();
+            const filtered = projects.filter(p => p.title.toLowerCase().includes(query));
+            const list = document.getElementById('projectList');
+            list.innerHTML = '';
+            filtered.forEach(p => {
+                const item = document.createElement('div');
+                item.className = "vault-card p-5 rounded-2xl flex justify-between items-center cursor-pointer hover:scale-[1.01] transition-all active:scale-[0.98]";
+                item.onclick = () => openProject(p.id);
+                item.innerHTML = `<div><h3 class="font-bold text-lg text-white">${p.title || 'Untitled'}</h3><p class="text-xs text-slate-300 opacity-70">Modified: ${new Date(p.lastModified).toLocaleDateString()}</p></div><span class="text-blue-200 font-bold">Open →</span>`;
+                list.appendChild(item);
+            });
+        }
+
+        async function openProject(id, resetUI = true) {
+            currentProjectId = id;
+            const project = await db.projects.get(id);
+            if (!project) return showDashboard();
+            if (resetUI) showAllButtons = false;
+            
+            document.getElementById('projectTitleInput').value = project.title;
+            document.getElementById('dashboard').classList.add('hidden');
+            document.getElementById('editor').classList.remove('hidden');
+            
+            const container = document.getElementById('cardContainer');
+            updateWrapButtonUI(project.isWrapped);
+            updateOptionsButtonUI();
+
+            const allCards = await db.cards
+                .where('[projectId+sortOrder]')
+                .between([id, Dexie.minKey], [id, Dexie.maxKey])
+                .toArray();
+
+            container.innerHTML = '';
+            
+            if (allCards.length === 0) {
+                renderEmptyState();
+            } else {
+                allCards.forEach(card => {
+                    container.appendChild(createCardElement(card, project.isWrapped));
+                    autoResize(document.getElementById(`text-${card.id}`));
+                });
+                initSortable();
+            }
+        }
+
+        async function refreshCurrentView() {
+            const scrollPos = window.scrollY;
+            await openProject(currentProjectId, false);
+            window.scrollTo(0, scrollPos);
+        }
+
+        function createCardElement(card, isWrapped) {
+            const imgClass = isWrapped ? 'img-wrapped' : 'img-unwrapped';
+            const cardWrapper = document.createElement('div');
+            cardWrapper.dataset.id = card.id;
+            cardWrapper.className = "timeline-item-container mb-4";
+            
+            const imageHtml = card.image 
+                ? `<img src="${card.image}" class="${imgClass}" id="img-display-${card.id}" />` 
+                : `<div class="h-24 flex items-center justify-center bg-slate-950/50 text-slate-500 text-xs italic" id="img-display-${card.id}">No image added</div>`;
+
+            cardWrapper.innerHTML = `
+                <div class="vault-card rounded-2xl overflow-hidden ${!showAllButtons ? 'hidden-options' : ''}">
+                    <div class="p-2 border-b border-white/5 bg-black/20 flex justify-between items-center btn-opt">
+                        <div class="flex items-center gap-2">
+                            <span class="drag-handle text-slate-400 hover:text-blue-400 p-1">⠿</span>
+                            <span class="text-[10px] text-slate-300 italic font-mono">ID: ${card.id}</span>
+                        </div>
+                        <button onclick="deleteCard(${card.id})" class="text-red-400 text-[10px] font-bold uppercase bg-red-900/30 px-2 py-1 rounded">Delete</button>
+                    </div>
+                    <div class="image-container relative" id="img-cont-${card.id}">
+                        ${imageHtml}
+                        <div class="p-2 flex gap-2 bg-black/20 border-t border-white/5 items-center">
+                            <button onclick="triggerUpload(${card.id})" class="flex-grow btn-opt bg-blue-600/20 text-blue-200 font-bold py-2 rounded-lg text-xs uppercase border border-blue-500/30 transition-all hover:bg-blue-600/40">Replace / Add</button>
+                            <div id="dl-cont-${card.id}" class="flex">
+                                ${card.image ? `<button onclick="downloadImage('${card.image}', ${card.id}, '${card.mimeType}')" class="keep-visible bg-slate-900/80 text-white px-4 py-2 rounded-lg font-bold shadow-sm text-xs border border-white/10 hover:bg-slate-800">Download ↓</button>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="p-4">
+                        <textarea id="text-${card.id}" readonly class="auto-expand w-full bg-black/20 border border-transparent rounded-lg p-2 text-slate-200 outline-none resize-none transition-all block focus:border-blue-500/50" oninput="autoResize(this)">${card.text || ''}</textarea>
+                        <div class="flex gap-2 mt-4">
+                            <button onclick="toggleEdit(${card.id})" id="edit-btn-${card.id}" class="flex-grow btn-opt bg-blue-600 text-white font-bold py-3 rounded-xl text-sm shadow-lg hover:bg-blue-500 transition-colors">Edit Text</button>
+                            <button onclick="copyCurrentText(${card.id})" class="px-6 bg-white/5 text-slate-300 font-bold py-3 rounded-xl text-sm hover:bg-white/10 transition-colors">Copy</button>
+                        </div>
+                    </div>
+                    <input type="file" id="file-${card.id}" class="hidden" accept="image/*" onchange="handleFileUpload(event, ${card.id})">
+                </div>
+                <div class="flex justify-center py-4 add-below-btn">
+                    <button onclick="addNewCard(${card.sortOrder})" class="group flex items-center gap-3 text-slate-400 hover:text-blue-300 transition-all">
+                        <div class="h-[1px] w-8 bg-current opacity-20"></div>
+                        <span class="text-[10px] font-black uppercase tracking-[0.3em]">+ Add Below</span>
+                        <div class="h-[1px] w-8 bg-current opacity-20"></div>
+                    </button>
+                </div>
+            `;
+            return cardWrapper;
+        }
+
+        function toggleOptions() {
+            showAllButtons = !showAllButtons;
+            document.querySelectorAll('.vault-card').forEach(card => {
+                showAllButtons ? card.classList.remove('hidden-options') : card.classList.add('hidden-options');
+            });
+            updateOptionsButtonUI();
+        }
+
+        function updateOptionsButtonUI() {
+            const btn = document.getElementById('toggleBtn');
+            btn.innerText = showAllButtons ? "Hide Options" : "Show Options";
+            btn.className = `whitespace-nowrap ${showAllButtons ? 'bg-blue-500' : 'bg-blue-900/40'} border border-blue-400/30 text-white px-4 py-2 rounded-lg text-xs font-bold uppercase transition-all`;
+            const actionBar = document.getElementById('timelineActions');
+            if (actionBar) actionBar.classList.toggle('hidden', !showAllButtons);
+        }
+
+        async function handleFileUpload(ev, id) {
+            const file = ev.target.files[0];
+            if (!file) return;
+            const mimeType = file.type;
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                const b64 = e.target.result;
+                await db.cards.update(id, { image: b64, mimeType: mimeType });
+                const img = document.getElementById(`img-display-${id}`);
+                const dlCont = document.getElementById(`dl-cont-${id}`);
+                const project = await db.projects.get(currentProjectId);
+                const imgClass = project.isWrapped ? 'img-wrapped' : 'img-unwrapped';
+
+                if (img.tagName === 'DIV') {
+                    const newImg = document.createElement('img');
+                    newImg.id = `img-display-${id}`;
+                    newImg.src = b64;
+                    newImg.className = imgClass;
+                    img.replaceWith(newImg);
+                } else {
+                    img.src = b64;
+                }
+                dlCont.innerHTML = `<button onclick="downloadImage('${b64}', ${id}, '${mimeType}')" class="keep-visible bg-slate-900/80 text-white px-4 py-2 rounded-lg font-bold shadow-sm text-xs border border-white/10 hover:bg-slate-800">Download ↓</button>`;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        async function addNewCard(targetSortOrder = null) {
+            const keys = await db.cards
+                .where("[projectId+sortOrder]")
+                .between([currentProjectId, Dexie.minKey], [currentProjectId, Dexie.maxKey])
+                .keys();
+            const sortOrders = keys.map((key) => Array.isArray(key) ? key[1] : key);
+            let newSortOrder;
+            if (sortOrders.length === 0) {
+                newSortOrder = 1000000;
+            } else if (targetSortOrder === null) {
+                newSortOrder = sortOrders[sortOrders.length - 1] + 1000000;
+            } else {
+                const index = sortOrders.findIndex(value => value === targetSortOrder);
+                const nextSortOrder = sortOrders[index + 1];
+                newSortOrder = nextSortOrder !== undefined ? (targetSortOrder + nextSortOrder) / 2 : targetSortOrder + 1000000;
+            }
+            await db.cards.add({ projectId: currentProjectId, text: "", image: null, sortOrder: newSortOrder });
+            await db.projects.update(currentProjectId, { lastModified: Date.now() });
+            await refreshCurrentView();
+        }
+
+        function downloadImage(b64, id, mimeType) {
+            const extension = mimeType ? mimeType.split('/')[1] : 'png';
+            const a = Object.assign(document.createElement('a'), { href: b64, download: `vault-img-${id}.${extension}` });
+            a.click();
+        }
+
+        function renderEmptyState() {
+            document.getElementById('cardContainer').innerHTML = `<div class="py-20 text-center"><button onclick="addNewCard()" class="bg-blue-600 hover:bg-blue-500 text-white px-8 py-4 rounded-2xl font-bold tracking-wide uppercase text-sm shadow-2xl transition-all scale-100 hover:scale-105">+ Start Timeline</button></div>`;
+        }
+
+        function showDashboard() {
+            currentProjectId = null;
+            document.getElementById('dashboard').classList.remove('hidden');
+            document.getElementById('editor').classList.add('hidden');
+            renderProjects();
+        }
+
+        async function createNewProject() {
+            const id = await db.projects.add({ title: "New Timeline", lastModified: Date.now(), isWrapped: false });
+            openProject(id);
+        }
+
+        function initSortable() {
+            const el = document.getElementById('cardContainer');
+            if (sortableInstance) sortableInstance.destroy();
+            sortableInstance = Sortable.create(el, {
+                handle: '.drag-handle', ghostClass: 'sortable-ghost', animation: 200,
+                onEnd: async function () {
+                    const itemEls = el.querySelectorAll('.timeline-item-container');
+                    const updates = [];
+                    for (let i = 0; i < itemEls.length; i++) {
+                        const id = parseInt(itemEls[i].dataset.id);
+                        updates.push(db.cards.update(id, { sortOrder: (i + 1) * 1000000 }));
+                    }
+                    await Promise.all(updates);
+                    await db.projects.update(currentProjectId, { lastModified: Date.now() });
+                }
+            });
+        }
+
+        function autoResize(el) { if(el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; } }
+
+        async function toggleWrap() {
+            const p = await db.projects.get(currentProjectId);
+            const newState = !p.isWrapped;
+            await db.projects.update(currentProjectId, { isWrapped: newState });
+            updateWrapButtonUI(newState);
+            await refreshCurrentView();
+        }
+
+        function updateWrapButtonUI(state) {
+            const btn = document.getElementById('wrapBtn');
+            btn.innerText = state ? "Unwrap Content" : "Wrap Content";
+            btn.className = `whitespace-nowrap ${state ? 'bg-blue-500' : 'bg-indigo-600'} text-white px-4 py-2 rounded-lg text-xs font-bold uppercase transition-all`;
+        }
+
+        async function toggleEdit(id) {
+            const tx = document.getElementById(`text-${id}`);
+            const btn = document.getElementById(`edit-btn-${id}`);
+            if (tx.hasAttribute('readonly')) {
+                tx.removeAttribute('readonly'); tx.classList.add('bg-black/40', 'border-blue-500/50'); tx.focus();
+                btn.innerText = "Save Changes"; btn.classList.replace('bg-blue-600', 'bg-emerald-600');
+            } else {
+                await db.cards.update(id, { text: tx.value });
+                tx.setAttribute('readonly', true); tx.classList.remove('bg-black/40', 'border-blue-500/50');
+                btn.innerText = "Edit Text"; btn.classList.replace('bg-emerald-600', 'bg-blue-600');
+            }
+        }
+
+        async function copyCurrentText(id) {
+            const tx = document.getElementById(`text-${id}`);
+            if(!tx.value) return;
+            await navigator.clipboard.writeText(tx.value);
+            tx.classList.add('copy-flash');
+            setTimeout(() => tx.classList.remove('copy-flash'), 600);
+        }
+
+        function triggerUpload(id) { document.getElementById(`file-${id}`).click(); }
+        async function deleteCard(id) { if(confirm("Delete card?")) { await db.cards.delete(id); await refreshCurrentView(); } }
+        async function deleteCurrentProject() {
+            if(confirm("Delete entire timeline?")) {
+                await db.cards.where('projectId').equals(currentProjectId).delete();
+                await db.projects.delete(currentProjectId);
+                showDashboard();
+            }
+        }
+
+        let ioBusy = false;
+        let wakeLockSentinel = null;
+        let nextYieldAt = 0;
+        const textEncoder = new TextEncoder();
+        const textDecoder = new TextDecoder();
+        const CRC_TABLE = (() => {
+            const table = new Uint32Array(256);
+            for (let n = 0; n < 256; n++) {
+                let c = n;
+                for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+                table[n] = c >>> 0;
+            }
+            return table;
+        })();
+
+        function sanitizeTimelineFolderName(name) {
+            const raw = (name || "").toString().trim();
+            const cleaned = raw
+                .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+                .replace(/\s+/g, " ")
+                .replace(/[. ]+$/g, "");
+            return cleaned || "Untitled Timeline";
+        }
+
+        function getImageExtensionFromMime(mimeType) {
+            if (!mimeType || mimeType.indexOf("/") < 0) return "png";
+            const clean = mimeType.split(";")[0].trim().toLowerCase();
+            const subtype = clean.split("/")[1] || "";
+            const ext = subtype.split("+")[0].replace(/[^a-z0-9]/g, "");
+            return ext || "bin";
+        }
+
+        function guessMimeTypeFromFilename(filename) {
+            const ext = ((filename || "").split(".").pop() || "").toLowerCase();
+            if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+            if (ext === "png") return "image/png";
+            if (ext === "gif") return "image/gif";
+            if (ext === "webp") return "image/webp";
+            if (ext === "bmp") return "image/bmp";
+            if (ext === "svg") return "image/svg+xml";
+            if (ext === "heic") return "image/heic";
+            if (ext === "heif") return "image/heif";
+            if (ext === "avif") return "image/avif";
+            if (ext === "tif" || ext === "tiff") return "image/tiff";
+            if (ext === "ico") return "image/x-icon";
+            if (ext === "pdf") return "application/pdf";
+            if (ext === "mp4") return "video/mp4";
+            if (ext === "webm") return "video/webm";
+            if (ext === "mov") return "video/quicktime";
+            if (ext === "bin") return "application/octet-stream";
+            return "image/png";
+        }
+
+        function sniffMime(bytes) {
+            if (!bytes || bytes.length < 4) return "";
+            if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return "image/jpeg";
+            if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return "image/png";
+            if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+            if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+            if (bytes[0] === 0x42 && bytes[1] === 0x4D) return "image/bmp";
+            if (bytes.length >= 12 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+                const brand = textDecoder.decode(bytes.subarray(8, 12));
+                if (brand === "avif" || brand === "avis") return "image/avif";
+                if (brand === "heic" || brand === "heix" || brand === "hevc" || brand === "mif1") return "image/heic";
+                if (brand === "qt  ") return "video/quicktime";
+                return "video/mp4";
+            }
+            if (bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) return "application/pdf";
+            return "";
+        }
+
+        function mimeFromDataUrl(dataUrl) {
+            const match = /^data:([^;,]+)/i.exec(dataUrl || "");
+            return match ? match[1].trim().toLowerCase() : "";
+        }
+
+        function fileBaseName(name) {
+            const normalized = (name || "").toString().replace(/\\/g, "/");
+            const slash = normalized.lastIndexOf("/");
+            return slash >= 0 ? normalized.slice(slash + 1) : normalized;
+        }
+
+        function yieldToMain() {
+            if (typeof scheduler !== "undefined" && typeof scheduler.yield === "function") return scheduler.yield();
+            return new Promise((resolve) => setTimeout(resolve, 0));
+        }
+
+        async function yieldIfDue(force) {
+            const now = Date.now();
+            if (!force && now < nextYieldAt) return;
+            await yieldToMain();
+            nextYieldAt = Date.now() + 48;
+        }
+
+        function showIO(title, detail, pct) {
+            const overlay = document.getElementById("ioOverlay");
+            if (!overlay) return;
+            overlay.hidden = false;
+            overlay.classList.remove("hidden");
+            document.getElementById("ioTitle").textContent = title || "Working";
+            document.getElementById("ioDetail").textContent = detail || "";
+            const width = Math.max(0, Math.min(100, pct || 0));
+            document.getElementById("ioBar").style.width = width + "%";
+        }
+
+        function hideIO() {
+            const overlay = document.getElementById("ioOverlay");
+            if (!overlay) return;
+            overlay.hidden = true;
+            overlay.classList.add("hidden");
+        }
+
+        async function acquireWakeLock() {
+            try {
+                if (navigator.wakeLock && navigator.wakeLock.request) {
+                    wakeLockSentinel = await navigator.wakeLock.request("screen");
+                }
+            } catch (err) {}
+        }
+
+        async function releaseWakeLock() {
+            try {
+                if (wakeLockSentinel) {
+                    await wakeLockSentinel.release();
+                    wakeLockSentinel = null;
+                }
+            } catch (err) {}
+        }
+
+        function crc32Update(crc, data) {
+            let c = crc;
+            for (let i = 0; i < data.length; i++) c = CRC_TABLE[(c ^ data[i]) & 0xFF] ^ (c >>> 8);
+            return c >>> 0;
+        }
+
+        async function crc32OfAsync(data) {
+            let c = 0xFFFFFFFF;
+            const step = 1024 * 1024;
+            for (let i = 0; i < data.length; i += step) {
+                c = crc32Update(c, data.subarray(i, Math.min(data.length, i + step)));
+                await yieldIfDue(false);
+            }
+            return (c ^ 0xFFFFFFFF) >>> 0;
+        }
+
+        function dosDateTime(date) {
+            const d = date || new Date();
+            const year = Math.max(1980, d.getFullYear());
+            const time = ((d.getHours() & 31) << 11) | ((d.getMinutes() & 63) << 5) | (Math.floor(d.getSeconds() / 2) & 31);
+            const day = ((Math.min(year, 2107) - 1980) << 9) | (((d.getMonth() + 1) & 15) << 5) | (d.getDate() & 31);
+            return { time, date: day };
+        }
+
+        function readU16(bytes, offset) {
+            return bytes[offset] | (bytes[offset + 1] << 8);
+        }
+
+        function readU32(bytes, offset) {
+            return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+        }
+
+        function readU64(bytes, offset) {
+            const lo = readU32(bytes, offset);
+            const hi = readU32(bytes, offset + 4);
+            const value = hi * 0x100000000 + lo;
+            if (!Number.isSafeInteger(value)) throw new Error("This backup is too large for this browser.");
+            return value;
+        }
+
+        function base64ToBytes(b64) {
+            const bin = atob(b64);
+            const out = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+            return out;
+        }
+
+        async function bytesToBase64(bytes) {
+            const parts = [];
+            const charsPerChunk = 3 * 65536;
+            const step = 8192;
+            for (let i = 0; i < bytes.length; i += charsPerChunk) {
+                const slice = bytes.subarray(i, Math.min(bytes.length, i + charsPerChunk));
+                let bin = "";
+                for (let j = 0; j < slice.length; j += step) {
+                    const sub = slice.subarray(j, Math.min(slice.length, j + step));
+                    bin += String.fromCharCode.apply(null, sub);
+                }
+                parts.push(btoa(bin));
+                await yieldIfDue(false);
+            }
+            return parts.join("");
+        }
+
+        function decodeZipName(bytes, flags) {
+            if (flags & 0x800) return textDecoder.decode(bytes);
+            try {
+                return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            } catch (err) {
+                let out = "";
+                for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+                return out;
+            }
+        }
+
+        function stripBom(text) {
+            return text && text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text;
+        }
+
+        class ChunkSink {
+            constructor() {
+                this.chunks = [];
+                this.cursor = 0;
+                this.size = 0;
+            }
+            async seek(pos) {
+                if (pos < 0 || pos > this.size) throw new Error("Could not write the backup file.");
+                this.cursor = pos;
+            }
+            async write(bytes) {
+                if (!bytes || !bytes.length) return;
+                const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+                if (this.cursor === this.size) {
+                    this.chunks.push(new Uint8Array(data));
+                    this.cursor += data.length;
+                    this.size = this.cursor;
+                    return;
+                }
+                let pos = this.cursor;
+                let offset = 0;
+                while (offset < data.length) {
+                    if (pos === this.size) {
+                        this.chunks.push(new Uint8Array(data.subarray(offset)));
+                        this.size += data.length - offset;
+                        pos = this.size;
+                        break;
+                    }
+                    let seen = 0;
+                    let index = 0;
+                    for (; index < this.chunks.length; index++) {
+                        const next = seen + this.chunks[index].length;
+                        if (pos < next) break;
+                        seen = next;
+                    }
+                    const chunk = this.chunks[index];
+                    const local = pos - seen;
+                    const take = Math.min(chunk.length - local, data.length - offset);
+                    chunk.set(data.subarray(offset, offset + take), local);
+                    pos += take;
+                    offset += take;
+                }
+                this.cursor = pos;
+            }
+            toBlob() {
+                return new Blob(this.chunks, { type: "application/zip" });
+            }
+        }
+
+        class StoredZipWriter {
+            constructor(sink) {
+                this.sink = sink;
+                this.offset = 0;
+                this.pos = 0;
+                this.entries = [];
+                this.current = null;
+                this.closed = false;
+            }
+            async _append(bytes) {
+                if (this.pos !== this.offset) {
+                    await this.sink.seek(this.offset);
+                    this.pos = this.offset;
+                }
+                await this.sink.write(bytes);
+                this.pos += bytes.length;
+                this.offset = this.pos;
+            }
+            async _patch(at, bytes) {
+                await this.sink.seek(at);
+                this.pos = at;
+                await this.sink.write(bytes);
+                this.pos = at + bytes.length;
+            }
+            async beginFile(path) {
+                const nameBytes = textEncoder.encode(path);
+                if (nameBytes.length > 0xFFFF) throw new Error("A file name in this backup is too long.");
+                const stamp = dosDateTime(new Date());
+                const headerPos = this.offset;
+                const header = new Uint8Array(30 + nameBytes.length);
+                const view = new DataView(header.buffer);
+                view.setUint32(0, 0x04034b50, true);
+                view.setUint16(4, 20, true);
+                view.setUint16(6, 0x0800, true);
+                view.setUint16(8, 0, true);
+                view.setUint16(10, stamp.time, true);
+                view.setUint16(12, stamp.date, true);
+                view.setUint16(26, nameBytes.length, true);
+                header.set(nameBytes, 30);
+                this.current = {
+                    nameBytes,
+                    headerPos,
+                    crc: 0xFFFFFFFF,
+                    size: 0,
+                    time: stamp.time,
+                    date: stamp.date,
+                    zip64Offset: headerPos >= 0xFFFFFFFF
+                };
+                await this._append(header);
+            }
+            async appendFile(bytes) {
+                if (!this.current) throw new Error("Backup writer is not ready.");
+                if (!bytes || !bytes.length) return;
+                const next = this.current.size + bytes.length;
+                if (next >= 0xFFFFFFFF) throw new Error("One file is larger than 4GB. Remove that attachment and try again.");
+                this.current.crc = crc32Update(this.current.crc, bytes);
+                this.current.size = next;
+                await this._append(bytes);
+            }
+            async endFile() {
+                const cur = this.current;
+                if (!cur) throw new Error("Backup writer is not ready.");
+                const crc = (cur.crc ^ 0xFFFFFFFF) >>> 0;
+                const patch = new Uint8Array(12);
+                const view = new DataView(patch.buffer);
+                view.setUint32(0, crc, true);
+                view.setUint32(4, cur.size, true);
+                view.setUint32(8, cur.size, true);
+                await this._patch(cur.headerPos + 14, patch);
+                this.entries.push({
+                    nameBytes: cur.nameBytes,
+                    crc,
+                    size: cur.size,
+                    offset: cur.headerPos,
+                    time: cur.time,
+                    date: cur.date,
+                    zip64Offset: cur.zip64Offset
+                });
+                this.current = null;
+            }
+            async addBytes(path, bytes) {
+                await this.beginFile(path);
+                const step = 1024 * 1024;
+                for (let i = 0; i < bytes.length; i += step) {
+                    await this.appendFile(bytes.subarray(i, Math.min(bytes.length, i + step)));
+                    await yieldIfDue(false);
+                }
+                await this.endFile();
+            }
+            async addText(path, text) {
+                await this.addBytes(path, textEncoder.encode(text));
+            }
+            cdRecord(entry) {
+                const extra = entry.zip64Offset ? new Uint8Array(12) : new Uint8Array(0);
+                if (entry.zip64Offset) {
+                    const extraView = new DataView(extra.buffer);
+                    extraView.setUint16(0, 1, true);
+                    extraView.setUint16(2, 8, true);
+                    extraView.setBigUint64(4, BigInt(entry.offset), true);
+                }
+                const buf = new Uint8Array(46);
+                const view = new DataView(buf.buffer);
+                const version = entry.zip64Offset ? 45 : 20;
+                view.setUint32(0, 0x02014b50, true);
+                view.setUint16(4, version, true);
+                view.setUint16(6, version, true);
+                view.setUint16(8, 0x0800, true);
+                view.setUint16(10, 0, true);
+                view.setUint16(12, entry.time, true);
+                view.setUint16(14, entry.date, true);
+                view.setUint32(16, entry.crc >>> 0, true);
+                view.setUint32(20, entry.size, true);
+                view.setUint32(24, entry.size, true);
+                view.setUint16(28, entry.nameBytes.length, true);
+                view.setUint16(30, extra.length, true);
+                view.setUint32(42, entry.zip64Offset ? 0xFFFFFFFF : entry.offset, true);
+                return { buf, extra };
+            }
+            async finish() {
+                if (this.current) throw new Error("Backup ended before a file was finished.");
+                const cdStart = this.offset;
+                for (let i = 0; i < this.entries.length; i++) {
+                    const record = this.cdRecord(this.entries[i]);
+                    await this._append(record.buf);
+                    await this._append(this.entries[i].nameBytes);
+                    if (record.extra.length) await this._append(record.extra);
+                }
+                const cdSize = this.offset - cdStart;
+                const count = this.entries.length;
+                const needZip64 = count >= 0xFFFF || cdStart >= 0xFFFFFFFF || cdSize >= 0xFFFFFFFF || this.entries.some((entry) => entry.zip64Offset);
+                if (needZip64) {
+                    const z64Offset = this.offset;
+                    const z64 = new Uint8Array(56);
+                    const z64View = new DataView(z64.buffer);
+                    z64View.setUint32(0, 0x06064b50, true);
+                    z64View.setBigUint64(4, 44n, true);
+                    z64View.setUint16(12, 45, true);
+                    z64View.setUint16(14, 45, true);
+                    z64View.setBigUint64(24, BigInt(count), true);
+                    z64View.setBigUint64(32, BigInt(count), true);
+                    z64View.setBigUint64(40, BigInt(cdSize), true);
+                    z64View.setBigUint64(48, BigInt(cdStart), true);
+                    await this._append(z64);
+                    const locator = new Uint8Array(20);
+                    const locatorView = new DataView(locator.buffer);
+                    locatorView.setUint32(0, 0x07064b50, true);
+                    locatorView.setBigUint64(8, BigInt(z64Offset), true);
+                    locatorView.setUint32(16, 1, true);
+                    await this._append(locator);
+                }
+                const eocd = new Uint8Array(22);
+                const eocdView = new DataView(eocd.buffer);
+                eocdView.setUint32(0, 0x06054b50, true);
+                eocdView.setUint16(8, count >= 0xFFFF ? 0xFFFF : count, true);
+                eocdView.setUint16(10, count >= 0xFFFF ? 0xFFFF : count, true);
+                eocdView.setUint32(12, cdSize >= 0xFFFFFFFF ? 0xFFFFFFFF : cdSize, true);
+                eocdView.setUint32(16, cdStart >= 0xFFFFFFFF ? 0xFFFFFFFF : cdStart, true);
+                await this._append(eocd);
+                await this.sink.close();
+                this.closed = true;
+            }
+            async abort() {
+                if (this.closed) return;
+                this.closed = true;
+                this.current = null;
+                try { await this.sink.abort(); } catch (err) {}
+            }
+        }
+
+        function downloadBlob(blob, fileName) {
+            const objectUrl = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = objectUrl;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 300000);
+        }
+
+        async function deliverSavedFile(file, filename) {
+            const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+            if (mobile && navigator.canShare) {
+                try {
+                    const shareFile = file.name === filename ? file : new File([file], filename, { type: "application/zip" });
+                    if (navigator.canShare({ files: [shareFile] })) {
+                        await navigator.share({ files: [shareFile], title: filename });
+                        return;
+                    }
+                } catch (err) {
+                    if (err && err.name === "AbortError") return;
+                    console.warn(err);
+                }
+            }
+            downloadBlob(file, filename);
+        }
+
+        async function cleanupBackupTemps(root) {
+            try {
+                if (!root.entries) return;
+                const stale = [];
+                for await (const [name] of root.entries()) {
+                    if (name.indexOf("vault-backup-") === 0 && name.endsWith(".zip")) stale.push(name);
+                }
+                for (let i = 0; i < stale.length; i++) {
+                    try { await root.removeEntry(stale[i]); } catch (err) {}
+                }
+            } catch (err) {}
+        }
+
+        async function chooseBackupSink(filename) {
+            if (typeof window.showSaveFilePicker === "function") {
+                let handle = null;
+                try {
+                    handle = await window.showSaveFilePicker({
+                        suggestedName: filename,
+                        types: [{ description: "ZIP archive", accept: { "application/zip": [".zip"] } }]
+                    });
+                } catch (err) {
+                    if (err && err.name === "AbortError") throw err;
+                    handle = null;
+                }
+                if (handle) {
+                    const writable = await handle.createWritable();
+                    if (typeof writable.seek !== "function") {
+                        try { await writable.abort(); } catch (err) {}
+                    } else return {
+                        async write(bytes) { await writable.write(bytes); },
+                        async seek(pos) { await writable.seek(pos); },
+                        async close() { await writable.close(); },
+                        async abort() { try { await writable.abort(); } catch (err) {} }
+                    };
+                }
+            }
+
+            try {
+                if (navigator.storage && typeof navigator.storage.getDirectory === "function") {
+                    const root = await navigator.storage.getDirectory();
+                    await cleanupBackupTemps(root);
+                    const safeName = filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_") || "Vault-Backup.zip";
+                    try { await root.removeEntry(safeName); } catch (err) {}
+                    const handle = await root.getFileHandle(safeName, { create: true });
+                    const writable = await handle.createWritable();
+                    if (typeof writable.seek !== "function") {
+                        try { await writable.abort(); } catch (err) {}
+                        throw new Error("Direct file writing is not available.");
+                    }
+                    return {
+                        async write(bytes) { await writable.write(bytes); },
+                        async seek(pos) { await writable.seek(pos); },
+                        async close() {
+                            await writable.close();
+                            const file = await handle.getFile();
+                            try {
+                                await deliverSavedFile(file, filename);
+                            } finally {
+                                setTimeout(() => { root.removeEntry(safeName).catch(() => {}); }, 300000);
+                            }
+                        },
+                        async abort() {
+                            try { await writable.abort(); } catch (err) {}
+                            try { await root.removeEntry(safeName); } catch (err) {}
+                        }
+                    };
+                }
+            } catch (err) {
+                console.warn(err);
+            }
+
+            const memory = new ChunkSink();
+            return {
+                write: (bytes) => memory.write(bytes),
+                seek: (pos) => memory.seek(pos),
+                async close() { downloadBlob(memory.toBlob(), filename); },
+                async abort() { memory.chunks.length = 0; }
+            };
+        }
+
+        async function addDataUrlFile(writer, zipPath, dataUrl) {
+            if (typeof dataUrl !== "string" || dataUrl.indexOf("data:") !== 0) {
+                throw new Error("An attachment is not in a readable format.");
+            }
+            const comma = dataUrl.indexOf(",");
+            if (comma < 0) throw new Error("An attachment is not in a readable format.");
+            const header = dataUrl.slice(5, comma);
+            const payloadStart = comma + 1;
+            await writer.beginFile(zipPath);
+            if (/;base64/i.test(header)) {
+                const chunkChars = 262144;
+                if (/[\s]/.test(dataUrl)) {
+                    const payload = dataUrl.slice(payloadStart).replace(/\s+/g, "");
+                    for (let i = 0; i < payload.length; i += chunkChars) {
+                        let slice = payload.slice(i, Math.min(payload.length, i + chunkChars));
+                        const mod = slice.length % 4;
+                        if (mod) slice += "====".slice(0, 4 - mod);
+                        await writer.appendFile(base64ToBytes(slice));
+                        await yieldIfDue(false);
+                    }
+                } else {
+                    for (let i = payloadStart; i < dataUrl.length; i += chunkChars) {
+                        let slice = dataUrl.slice(i, Math.min(dataUrl.length, i + chunkChars));
+                        const mod = slice.length % 4;
+                        if (mod) slice += "====".slice(0, 4 - mod);
+                        await writer.appendFile(base64ToBytes(slice));
+                        await yieldIfDue(false);
+                    }
+                }
+            } else {
+                await writer.appendFile(textEncoder.encode(decodeURIComponent(dataUrl.slice(payloadStart))));
+            }
+            await writer.endFile();
+        }
+
+        async function cardIdsForProject(projectId) {
+            return db.cards
+                .where("[projectId+sortOrder]")
+                .between([projectId, Dexie.minKey], [projectId, Dexie.maxKey])
+                .primaryKeys();
+        }
+
+        async function buildBackup(sink, options) {
+            const projectId = options && options.projectId;
+            const onProgress = options && options.onProgress;
+            const writer = new StoredZipWriter(sink);
+            try {
+                const projects = projectId
+                    ? [await db.projects.get(projectId)]
+                    : await db.projects.toArray();
+                if (projectId && !projects[0]) throw new Error("Timeline not found.");
+                const groups = [];
+                let totalCards = 0;
+                for (let i = 0; i < projects.length; i++) {
+                    const ids = await cardIdsForProject(projects[i].id);
+                    groups.push(ids);
+                    totalCards += ids.length;
+                }
+                const usedFolderNames = new Set();
+                let done = 0;
+                const report = async (label) => {
+                    if (onProgress) onProgress(done, totalCards, label);
+                    await yieldIfDue(false);
+                };
+                for (let p = 0; p < projects.length; p++) {
+                    const project = projects[p];
+                    const baseName = sanitizeTimelineFolderName(project.title);
+                    let folderName = baseName;
+                    let counter = 2;
+                    while (usedFolderNames.has(folderName)) folderName = baseName + "-" + (counter++);
+                    usedFolderNames.add(folderName);
+                    await writer.beginFile(folderName + "/");
+                    await writer.endFile();
+                    const timelineJsonCards = [];
+                    const ids = groups[p];
+                    for (let c = 0; c < ids.length; c++) {
+                        const card = await db.cards.get(ids[c]);
+                        if (!card) {
+                            done++;
+                            continue;
+                        }
+                        const image = card.image;
+                        card.image = null;
+                        let mimeType = card.mimeType;
+                        if (!mimeType && typeof image === "string") mimeType = mimeFromDataUrl(image);
+                        const stored = Object.assign({}, card);
+                        delete stored.image;
+                        if (mimeType) stored.mimeType = mimeType;
+                        if (!image) {
+                            stored.imageFileName = null;
+                            timelineJsonCards.push(stored);
+                        } else {
+                            const ext = getImageExtensionFromMime(mimeType);
+                            const imageFileName = "card_" + card.id + "." + ext;
+                            stored.imageFileName = imageFileName;
+                            timelineJsonCards.push(stored);
+                            await report("Saving " + (done + 1) + " of " + totalCards + " · " + folderName);
+                            try {
+                                await addDataUrlFile(writer, folderName + "/" + imageFileName, image);
+                            } catch (err) {
+                                throw new Error("Could not read the attachment on card " + card.id + " in \"" + (project.title || folderName) + "\".");
+                            }
+                        }
+                        done++;
+                        await report("Saved " + done + " of " + totalCards);
+                    }
+                    await report("Writing timeline details…");
+                    await writer.addText(folderName + "/timeline.json", JSON.stringify({ project, cards: timelineJsonCards }, null, 2));
+                }
+                await report("Finishing backup…");
+                await writer.addText("backup_manifest.json", JSON.stringify({
+                    version: 2,
+                    format: "timeline-folders",
+                    createdAt: new Date().toISOString(),
+                    timelineCount: projects.length
+                }, null, 2));
+                await writer.finish();
+            } catch (err) {
+                await writer.abort();
+                throw err;
+            }
+        }
+
+        async function runBackup(button, filename, projectId) {
+            if (!button || button.disabled || ioBusy) return;
+            const original = button.innerText;
+            const token = {};
+            button._labelToken = token;
+            ioBusy = true;
+            button.disabled = true;
+            button.innerText = "Preparing...";
+            let finished = false;
+            showIO("Creating backup", "Choose where to save, then keep this page open.", 0);
+            try {
+                const sink = await chooseBackupSink(filename);
+                await acquireWakeLock();
+                await buildBackup(sink, {
+                    projectId,
+                    onProgress: (done, total, label) => {
+                        const pct = total ? Math.round((done / total) * 100) : (label.indexOf("Finishing") === 0 ? 100 : 0);
+                        showIO("Creating backup", label, pct);
+                        if (button._labelToken === token) button.innerText = total ? ("Backup " + pct + "%") : "Backup...";
+                    }
+                });
+                finished = true;
+                showIO("Creating backup", "Backup saved.", 100);
+                if (button._labelToken === token) button.innerText = "Saved";
+            } catch (err) {
+                if (!(err && err.name === "AbortError")) {
+                    console.error(err);
+                    const message = err && err.name === "QuotaExceededError"
+                        ? "Not enough free space to save this backup."
+                        : ((err && err.message) || err);
+                    alert("Backup failed: " + message);
+                }
+            } finally {
+                hideIO();
+                await releaseWakeLock();
+                ioBusy = false;
+                button.disabled = false;
+                if (finished) {
+                    setTimeout(() => {
+                        if (button._labelToken === token) button.innerText = original;
+                    }, 1600);
+                } else if (button._labelToken === token) {
+                    button.innerText = original;
+                }
+            }
+        }
+
+        function exportAllData() {
+            const date = new Date().toISOString().slice(0, 10);
+            return runBackup(document.getElementById("exportBtn"), "Vault-Backup-" + date + ".zip", null);
+        }
+
+        function exportCurrentTimeline() {
+            if (!currentProjectId) return;
+            const title = document.getElementById("projectTitleInput").value;
+            const safeTimelineName = sanitizeTimelineFolderName(title).replace(/\s+/g, "-");
+            const date = new Date().toISOString().slice(0, 10);
+            return runBackup(document.getElementById("exportCurrentBtn"), safeTimelineName + "-Backup-" + date + ".zip", currentProjectId);
+        }
+
+        async function copyCurrentTimelineAllText() {
+            if (!currentProjectId) return;
+            const ids = await cardIdsForProject(currentProjectId);
+            const texts = [];
+            for (let i = 0; i < ids.length; i++) {
+                const card = await db.cards.get(ids[i]);
+                const text = ((card && card.text) || "").toString();
+                if (text.trim().length > 0) texts.push(text);
+                await yieldIfDue(false);
+            }
+
+            if (!texts.length) {
+                alert("No text found in this timeline.");
+                return;
+            }
+
+            const combinedText = texts.join("\n\n---\n\n");
+            try {
+                await navigator.clipboard.writeText(combinedText);
+            } catch {
+                const ta = document.createElement("textarea");
+                ta.value = combinedText;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+            }
+            alert(`Copied text from ${texts.length} card(s).`);
+        }
+
+        function triggerRestore() {
+            if (ioBusy) return;
+            document.getElementById("restoreFile").click();
+        }
+
+        function findEocd(bytes) {
+            for (let i = bytes.length - 22; i >= 0; i--) {
+                if (bytes[i] !== 0x50 || bytes[i + 1] !== 0x4B || bytes[i + 2] !== 0x05 || bytes[i + 3] !== 0x06) continue;
+                const commentLen = readU16(bytes, i + 20);
+                if (i + 22 + commentLen === bytes.length) return i;
+            }
+            return -1;
+        }
+
+        function parseZip64Extra(extra, needUncomp, needComp, needOffset, needDisk) {
+            let p = 0;
+            while (p + 4 <= extra.length) {
+                const id = readU16(extra, p);
+                const size = readU16(extra, p + 2);
+                const start = p + 4;
+                const end = start + size;
+                if (end > extra.length) break;
+                if (id === 1) {
+                    let o = start;
+                    const result = {};
+                    if (needUncomp) { result.uncomp = readU64(extra, o); o += 8; }
+                    if (needComp) { result.comp = readU64(extra, o); o += 8; }
+                    if (needOffset) { result.offset = readU64(extra, o); o += 8; }
+                    if (needDisk) { result.disk = readU32(extra, o); }
+                    return result;
+                }
+                p = end;
+            }
+            throw new Error("Backup file is damaged.");
+        }
+
+        async function readRange(file, start, end) {
+            if (start < 0 || end < start || end > file.size) throw new Error("Backup file is damaged.");
+            const buf = await file.slice(start, end).arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            if (bytes.length !== end - start) throw new Error("Backup file is damaged.");
+            return bytes;
+        }
+
+        async function readZipIndex(file) {
+            if (!file || file.size < 22) throw new Error("Backup file is damaged.");
+            const tailLen = Math.min(file.size, 22 + 65535 + 128);
+            const tail = await readRange(file, file.size - tailLen, file.size);
+            const eocdAt = findEocd(tail);
+            if (eocdAt < 0) throw new Error("No timeline backup data found in ZIP.");
+            let totalEntries = readU16(tail, eocdAt + 10);
+            let cdSize = readU32(tail, eocdAt + 12);
+            let cdOffset = readU32(tail, eocdAt + 16);
+            if (totalEntries === 0xFFFF || cdSize === 0xFFFFFFFF || cdOffset === 0xFFFFFFFF) {
+                const loc = eocdAt - 20;
+                if (loc >= 0 && tail[loc] === 0x50 && tail[loc + 1] === 0x4B && tail[loc + 2] === 0x06 && tail[loc + 3] === 0x07) {
+                    const z64Offset = readU64(tail, loc + 8);
+                    const z64 = await readRange(file, z64Offset, z64Offset + 56);
+                    if (readU32(z64, 0) !== 0x06064b50) throw new Error("Backup file is damaged.");
+                    totalEntries = readU64(z64, 32);
+                    cdSize = readU64(z64, 40);
+                    cdOffset = readU64(z64, 48);
+                }
+            }
+            const cd = cdSize ? await readRange(file, cdOffset, cdOffset + cdSize) : new Uint8Array(0);
+            const entries = new Map();
+            let p = 0;
+            while (p + 46 <= cd.length) {
+                if (readU32(cd, p) !== 0x02014b50) break;
+                const flags = readU16(cd, p + 8);
+                const method = readU16(cd, p + 10);
+                const crc = readU32(cd, p + 16);
+                let compSize = readU32(cd, p + 20);
+                let uncompSize = readU32(cd, p + 24);
+                const nameLen = readU16(cd, p + 28);
+                const extraLen = readU16(cd, p + 30);
+                const commentLen = readU16(cd, p + 32);
+                const diskStart = readU16(cd, p + 34);
+                let localOffset = readU32(cd, p + 42);
+                const nameStart = p + 46;
+                const nameBytes = cd.subarray(nameStart, nameStart + nameLen);
+                const extra = cd.subarray(nameStart + nameLen, nameStart + nameLen + extraLen);
+                const needUncomp = uncompSize === 0xFFFFFFFF;
+                const needComp = compSize === 0xFFFFFFFF;
+                const needOffset = localOffset === 0xFFFFFFFF;
+                const needDisk = diskStart === 0xFFFF;
+                if (needUncomp || needComp || needOffset || needDisk) {
+                    const extraInfo = parseZip64Extra(extra, needUncomp, needComp, needOffset, needDisk);
+                    if (needUncomp) uncompSize = extraInfo.uncomp;
+                    if (needComp) compSize = extraInfo.comp;
+                    if (needOffset) localOffset = extraInfo.offset;
+                }
+                if (diskStart !== 0 && diskStart !== 0xFFFF) throw new Error("Split backups are not supported.");
+                const name = decodeZipName(nameBytes, flags).replace(/\\/g, "/").replace(/^\.\//, "");
+                entries.set(name, { name, flags, method, crc, compSize, uncompSize, localOffset });
+                p = nameStart + nameLen + extraLen + commentLen;
+            }
+            return { file, entries };
+        }
+
+        function zipGet(zip, path) {
+            if (!path) return null;
+            const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
+            if (zip.entries.has(normalized)) return zip.entries.get(normalized);
+            if (zip.entries.has(path)) return zip.entries.get(path);
+            return null;
+        }
+
+        async function inflateRaw(bytes) {
+            if (typeof DecompressionStream !== "function") {
+                throw new Error("This backup is compressed and this browser cannot open it.");
+            }
+            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+            const buf = await new Response(stream).arrayBuffer();
+            return new Uint8Array(buf);
+        }
+
+        async function readZipBytes(zip, entry) {
+            if (!entry) return null;
+            if (entry.method !== 0 && entry.method !== 8) throw new Error("Unsupported compression in backup.");
+            if (entry.flags & 1) throw new Error("Encrypted backups are not supported.");
+            if (entry.compSize > 0x80000000 || entry.uncompSize > 0x80000000) {
+                throw new Error("A file in this backup is too large to restore on this device.");
+            }
+            const head = await readRange(zip.file, entry.localOffset, entry.localOffset + 30);
+            if (readU32(head, 0) !== 0x04034b50) throw new Error("Backup file is damaged.");
+            const nameLen = readU16(head, 26);
+            const extraLen = readU16(head, 28);
+            const dataStart = entry.localOffset + 30 + nameLen + extraLen;
+            const compressed = entry.compSize
+                ? await readRange(zip.file, dataStart, dataStart + entry.compSize)
+                : new Uint8Array(0);
+            const raw = entry.method === 8 ? await inflateRaw(compressed) : compressed;
+            const crc = await crc32OfAsync(raw);
+            if (crc !== entry.crc) throw new Error("Backup file is damaged (" + entry.name + ").");
+            return raw;
+        }
+
+        async function readZipText(zip, entry) {
+            const bytes = await readZipBytes(zip, entry);
+            return bytes ? stripBom(textDecoder.decode(bytes)) : "";
+        }
+
+        async function fileLooksLikeZip(file) {
+            if (!file || file.size < 4) return false;
+            const name = (file.name || "").toLowerCase();
+            if (name.endsWith(".zip")) return true;
+            const head = await readRange(file, 0, 4);
+            return head[0] === 0x50 && head[1] === 0x4B;
+        }
+
+        async function attachmentToDataUrl(bytes, mimeType, filename) {
+            let mime = mimeType || "";
+            if (!mime || mime === "application/octet-stream") {
+                mime = sniffMime(bytes) || guessMimeTypeFromFilename(filename) || "image/png";
+            }
+            const b64 = await bytesToBase64(bytes);
+            return { mime, image: "data:" + mime + ";base64," + b64 };
+        }
+
+        async function restoreTimelinePayloads(zip, payloads) {
+            let done = 0;
+            let total = 0;
+            for (let i = 0; i < payloads.length; i++) total += payloads[i].cards.length;
+            await db.projects.clear();
+            await db.cards.clear();
+            for (let t = 0; t < payloads.length; t++) {
+                const timeline = payloads[t];
+                const proj = Object.assign({}, timeline.project);
+                delete proj.id;
+                const newProjectId = await db.projects.add(proj);
+                for (let c = 0; c < timeline.cards.length; c++) {
+                    const sourceCard = timeline.cards[c];
+                    const card = Object.assign({}, sourceCard, { projectId: newProjectId });
+                    delete card.id;
+                    const imageFileName = fileBaseName(card.imageFileName);
+                    if (zip && imageFileName) {
+                        const imgEntry = zipGet(zip, timeline.folderPath + imageFileName);
+                        if (imgEntry) {
+                            const bytes = await readZipBytes(zip, imgEntry);
+                            const built = await attachmentToDataUrl(bytes, card.mimeType, imageFileName);
+                            card.mimeType = card.mimeType || built.mime;
+                            card.image = built.image;
+                        }
+                    }
+                    delete card.hasImage;
+                    delete card.imageExt;
+                    delete card.imageFileName;
+                    await db.cards.add(card);
+                    done++;
+                    showIO("Restoring backup", "Restored " + done + " of " + total + " cards", total ? Math.round((done / total) * 100) : 100);
+                    await yieldIfDue(false);
+                }
+            }
+        }
+
+        async function restoreLegacy(zip, projects, cards) {
+            const projectIdMap = new Map();
+            await db.projects.clear();
+            await db.cards.clear();
+            for (let i = 0; i < projects.length; i++) {
+                const oldId = projects[i].id;
+                const proj = Object.assign({}, projects[i]);
+                delete proj.id;
+                const newId = await db.projects.add(proj);
+                projectIdMap.set(oldId, newId);
+                await yieldIfDue(false);
+            }
+            let stored = 0;
+            for (let i = 0; i < cards.length; i++) {
+                const source = cards[i];
+                const projectId = projectIdMap.get(source.projectId);
+                if (projectId === undefined) continue;
+                const card = Object.assign({}, source, { projectId });
+                const oldCardId = card.id;
+                delete card.id;
+                if (zip && card.hasImage) {
+                    const ext = card.imageExt || "png";
+                    const imgEntry = zipGet(zip, "images/card_" + oldCardId + "." + ext);
+                    if (imgEntry) {
+                        const bytes = await readZipBytes(zip, imgEntry);
+                        card.image = "data:image/" + ext + ";base64," + await bytesToBase64(bytes);
+                        card.mimeType = "image/" + ext;
+                    }
+                }
+                delete card.hasImage;
+                delete card.imageExt;
+                delete card.imageFileName;
+                await db.cards.add(card);
+                stored++;
+                showIO("Restoring backup", "Restored " + stored + " of " + cards.length + " cards", cards.length ? Math.round((stored / cards.length) * 100) : 100);
+                await yieldIfDue(false);
+            }
+        }
+
+        async function importAllData(ev) {
+            const file = ev.target.files && ev.target.files[0];
+            ev.target.value = "";
+            if (!file || ioBusy) return;
+            const btn = document.getElementById("restoreBtn");
+            const originalText = btn.innerText;
+            ioBusy = true;
+            btn.disabled = true;
+            btn.innerText = "Restoring...";
+            await acquireWakeLock();
+            showIO("Reading backup", "Checking the file…", 0);
+            try {
+                let projects = [];
+                let cards = null;
+                let zip = null;
+                let timelinePayloads = null;
+                if (await fileLooksLikeZip(file)) {
+                    zip = await readZipIndex(file);
+                    const legacyEntry = zipGet(zip, "data.json");
+                    if (legacyEntry) {
+                        const parsed = JSON.parse(await readZipText(zip, legacyEntry));
+                        projects = parsed.projects || [];
+                        cards = parsed.cards || [];
+                    } else {
+                        const timelineJsonPaths = [];
+                        zip.entries.forEach((entry, path) => {
+                            if (path.toLowerCase().endsWith("/timeline.json")) timelineJsonPaths.push(path);
+                        });
+                        if (!timelineJsonPaths.length) {
+                            const manifestEntry = zipGet(zip, "backup_manifest.json");
+                            if (!manifestEntry) throw new Error("No timeline backup data found in ZIP.");
+                            const manifest = JSON.parse(await readZipText(zip, manifestEntry));
+                            if (!manifest || manifest.format !== "timeline-folders") throw new Error("No timeline backup data found in ZIP.");
+                            timelinePayloads = [];
+                            projects = [];
+                        } else {
+                            timelinePayloads = [];
+                            for (let i = 0; i < timelineJsonPaths.length; i++) {
+                                const timelineJsonPath = timelineJsonPaths[i];
+                                const parsed = JSON.parse(await readZipText(zip, zip.entries.get(timelineJsonPath)));
+                                if (!parsed || !parsed.project || !Array.isArray(parsed.cards)) {
+                                    throw new Error("Invalid timeline data in " + timelineJsonPath);
+                                }
+                                const folderPath = timelineJsonPath.slice(0, timelineJsonPath.lastIndexOf("/") + 1);
+                                timelinePayloads.push({ folderPath, project: parsed.project, cards: parsed.cards });
+                                await yieldIfDue(false);
+                            }
+                            projects = timelinePayloads.map((item) => item.project);
+                        }
+                    }
+                } else {
+                    const parsed = JSON.parse(stripBom(await file.text()));
+                    projects = parsed.projects || [];
+                    cards = parsed.cards || [];
+                }
+
+                if (!Array.isArray(projects) || (!timelinePayloads && !Array.isArray(cards))) {
+                    throw new Error("No timeline backup data found in ZIP.");
+                }
+                hideIO();
+                if (!confirm("This will clear existing data and restore " + projects.length + " timelines. Continue?")) return;
+
+                showIO("Restoring backup", "Replacing saved timelines…", 0);
+                let replaced = false;
+                try {
+                    replaced = true;
+                    if (timelinePayloads) await restoreTimelinePayloads(zip, timelinePayloads);
+                    else await restoreLegacy(zip, projects, cards);
+                } catch (err) {
+                    if (replaced) err.restoreIncomplete = true;
+                    throw err;
+                }
+                alert("Restore completed successfully!");
+                location.reload();
+            } catch (err) {
+                console.error(err);
+                const message = (err && err.message) || err;
+                alert(err && err.restoreIncomplete
+                    ? "Restore failed, and the saved timelines may be incomplete. Try the backup again. " + message
+                    : "Restore failed: " + message);
+            } finally {
+                hideIO();
+                await releaseWakeLock();
+                ioBusy = false;
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        document.getElementById('projectTitleInput').addEventListener('input', async (e) => {
+            if (currentProjectId) {
+                await db.projects.update(currentProjectId, { title: e.target.value, lastModified: Date.now() });
+            }
+        });
+
+        init();
+    </script>
+</body>
+</html>
